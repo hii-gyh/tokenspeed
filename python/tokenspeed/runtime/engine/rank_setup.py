@@ -270,4 +270,5 @@ def scheduler_config_from_args(
         state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
         checkpoint_retention_requests=server_args.checkpoint_retention_requests,
         checkpoint_retention_leaf_distance=server_args.checkpoint_retention_leaf_distance,
+        prefill_chunk_yield_tokens=server_args.scheduler_prefill_chunk_yield_tokens,
     )
