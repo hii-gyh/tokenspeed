@@ -494,6 +494,13 @@ class MoELayer(torch.nn.Module):
             routing_mode = "precomputed_topk"
         elif output_scale != 1.0:
             raise ValueError("MoE output_scale requires an explicit precision policy")
+        if (
+            process_group is None
+            and self._spec.a2a_backend == "ascend"
+            and self.ep_size > 1
+        ):
+            mapping = global_server_args_dict["mapping"]
+            process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
         self.plan = kernel_moe_plan(
             self._quant_kind,
             input_dtype=input_dtype,

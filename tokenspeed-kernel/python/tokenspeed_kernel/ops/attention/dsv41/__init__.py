@@ -51,7 +51,14 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.attention.dsv41._inputs import IndexKeyInput, IndexQueryInput
+from tokenspeed_kernel.ops.attention.dsv41.pages import (
+    adapt_flatkv_decode_selections,
+    as_pa_bbnd,
+    lcm_block_table_as_pa,
+    materialize_bf16_rows_as_pa_bbnd,
+)
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -95,6 +102,10 @@ __all__ = [
     "dspark_anchors",
     "dspark_block",
     "dspark_workspace",
+    "adapt_flatkv_decode_selections",
+    "as_pa_bbnd",
+    "lcm_block_table_as_pa",
+    "materialize_bf16_rows_as_pa_bbnd",
 ]
 
 
@@ -1024,7 +1035,7 @@ def dspark_anchors(
         if tensor.dtype not in (torch.int32, torch.int64) or not tensor.is_contiguous():
             raise ValueError("DSpark anchor inputs must be contiguous integers")
     if not positions.is_cuda:
-        rows = torch.arange(num_decodes)
+        rows = torch.arange(num_decodes, device=positions.device)
         accepted = accept_lengths[num_extends:].to(torch.int64).clamp(1, width)
         verify = num_prefill_outputs + rows * width + accepted - 1
         next_tokens[:num_prefill_outputs].copy_(
@@ -1084,13 +1095,19 @@ def dspark_block(
         device = bonus.device
         ids = torch.full((n, block_size), noise_token, dtype=torch.int32, device=device)
         ids[:, 0] = bonus
-        positions = start_pos.to(torch.int64)[:, None] + 1 + torch.arange(block_size)
-        pre_mix = torch.zeros((n * block_size, hc_mult), dtype=torch.float32)
+        positions = start_pos.to(torch.int64)[:, None] + 1 + torch.arange(
+            block_size, device=device
+        )
+        pre_mix = torch.zeros(
+            (n * block_size, hc_mult), dtype=torch.float32, device=device
+        )
         pre_mix[:, 0] = 1
-        request_indices = torch.arange(n).repeat_interleave(block_size)
+        request_indices = torch.arange(n, device=device).repeat_interleave(block_size)
         slots = history_slots.clamp_min(0).long()
         width = window + block_size
-        indices = torch.arange(n * width, dtype=torch.int32).view(n, width)
+        indices = torch.arange(n * width, dtype=torch.int32, device=device).view(
+            n, width
+        )
         indices[:, :window].masked_fill_(history_slots < 0, -1)
         indices = indices[:, None, :].expand(-1, block_size, -1).reshape(-1, width)
         return (
@@ -1152,10 +1169,13 @@ def decode_rows(
     if not positions.is_cuda:
         lengths.zero_()
         lengths[:actual_bs].copy_(seq_lens[:actual_bs].clamp_min(width))
+        device = positions.device
         positions.view(bs, width).copy_(
-            lengths.to(torch.int64)[:, None] - width + torch.arange(width)
+            lengths.to(torch.int64)[:, None]
+            - width
+            + torch.arange(width, device=device)
         )
-        requests.view(bs, width).copy_(torch.arange(bs)[:, None])
+        requests.view(bs, width).copy_(torch.arange(bs, device=device)[:, None])
         for tensor in (positions, requests):
             tensor[: num_extends * width].fill_(-1)
             tensor[actual_bs * width :].fill_(-1)
@@ -1199,7 +1219,9 @@ def decode_window(
             bounded_group_slots,
         )
 
-        wanted = (positions - 127).clamp_min(0)[:, None] + torch.arange(128)
+        wanted = (positions - 127).clamp_min(0)[:, None] + torch.arange(
+            128, device=positions.device
+        )
         wanted.masked_fill_(wanted > positions[:, None], -1)
         slots = bounded_group_slots(
             wanted, requests[:, None].expand_as(wanted), swa_table, 64, 1, 1, swa_pages
@@ -1251,7 +1273,12 @@ def selection_table(positions, requests, table, ratio):
     and int32 visible lengths[N]. ratio is raw tokens per global cache row.
     """
     if not positions.is_cuda:
-        out = torch.full((positions.numel(), table.shape[1]), -1, dtype=torch.int32)
+        out = torch.full(
+            (positions.numel(), table.shape[1]),
+            -1,
+            dtype=torch.int32,
+            device=positions.device,
+        )
         if table.numel():
             values = table[requests.clamp(0, table.shape[0] - 1)]
             out.copy_(
@@ -1304,7 +1331,9 @@ def compressor_metadata(
             & (positions[:-1] == pair_positions[1:])
         )
         previous[1:].copy_(
-            torch.arange(max(positions.numel() - 1, 0)).masked_fill(~in_batch, -1)
+            torch.arange(
+                max(positions.numel() - 1, 0), device=positions.device
+            ).masked_fill(~in_batch, -1)
         )
         read_slots.copy_(
             bounded_group_slots(pair_positions, pair_requests, table, 2, 1, 1, pages)
@@ -1377,6 +1406,9 @@ import tokenspeed_kernel.ops.attention.dsv41.deep_select  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.flash_mla  # noqa: E402,F401
 
+if current_platform().is_npu:
+    import tokenspeed_kernel.ops.attention.dsv41.ascend  # noqa: E402,F401
+
 # isort: on
 
 
@@ -1430,7 +1462,9 @@ def index_select_all(page_table, visible_lens, pages, candidate_block_size, out)
             page_table, visible_lens, pages, candidate_block_size, out
         )
     for destination, counts, stride in ((rows, lengths, 1), (blocks, block_lengths, 8)):
-        ids = torch.arange(destination.shape[1], dtype=torch.int32)
+        ids = torch.arange(
+            destination.shape[1], dtype=torch.int32, device=page_table.device
+        )
         offsets = ids * stride
         valid = offsets[None, :] < visible_lens[:, None]
         if page_table.shape[1]:

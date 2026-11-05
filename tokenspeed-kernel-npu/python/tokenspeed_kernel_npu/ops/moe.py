@@ -84,7 +84,7 @@ def ascend_bf16_process_moe_weights(*, plan: dict, w: torch.nn.Module) -> None:
 
     if plan.get("a2a_backend") != "ascend":
         return
-    process_group = plan.get("ep_group")
+    process_group = plan.get("ep_group") or plan.get("process_group")
     if process_group is None:
         raise ValueError("Ascend distributed MoE requires an EP process group")
     backend = process_group._get_backend(w.w13_weight.device)
@@ -132,46 +132,113 @@ def ascend_bf16_process_moe_weights(*, plan: dict, w: torch.nn.Module) -> None:
 
 def ascend_int8_process_moe_weights(*, plan: dict, w: torch.nn.Module) -> None:
     """Transpose canonical INT8 expert weights and persist them in NZ."""
-    del plan
-    if getattr(w, "_ascend_int8_moe_weights_processed", False):
-        return
-    expected = (
-        (w.num_local_experts, 2 * w.intermediate_size, w.hidden_size),
-        (w.num_local_experts, w.hidden_size, w.intermediate_size),
-        (w.num_local_experts, 2 * w.intermediate_size),
-        (w.num_local_experts, w.hidden_size),
-    )
-    actual = (
-        tuple(w.w13_weight.shape),
-        tuple(w.w2_weight.shape),
-        tuple(w.w13_weight_scale.shape),
-        tuple(w.w2_weight_scale.shape),
-    )
-    if actual != expected:
-        raise ValueError("Ascend W8A8 MoE weights must use canonical layouts")
-    if w.w13_weight.dtype != torch.int8 or w.w2_weight.dtype != torch.int8:
-        raise TypeError("Ascend W8A8 MoE weights must be INT8")
+    if not getattr(w, "_ascend_int8_moe_weights_processed", False):
+        expected = (
+            (w.num_local_experts, 2 * w.intermediate_size, w.hidden_size),
+            (w.num_local_experts, w.hidden_size, w.intermediate_size),
+            (w.num_local_experts, 2 * w.intermediate_size),
+            (w.num_local_experts, w.hidden_size),
+        )
+        actual = (
+            tuple(w.w13_weight.shape),
+            tuple(w.w2_weight.shape),
+            tuple(w.w13_weight_scale.shape),
+            tuple(w.w2_weight_scale.shape),
+        )
+        if actual != expected:
+            raise ValueError("Ascend W8A8 MoE weights must use canonical layouts")
+        if w.w13_weight.dtype != torch.int8 or w.w2_weight.dtype != torch.int8:
+            raise TypeError("Ascend W8A8 MoE weights must be INT8")
 
-    w.w13_weight.data = _format_grouped_weight_nz(
-        w.w13_weight.data.transpose(-1, -2).contiguous()
+        w.w13_weight.data = _format_grouped_weight_nz(
+            w.w13_weight.data.transpose(-1, -2).contiguous()
+        )
+        w.w2_weight.data = _format_grouped_weight_nz(
+            w.w2_weight.data.transpose(-1, -2).contiguous()
+        )
+        w.w13_weight_scale.data = w.w13_weight_scale.data.float().contiguous()
+        w.w2_weight_scale.data = w.w2_weight_scale.data.contiguous()
+        for name in ("w13_smooth_scale", "w2_smooth_scale"):
+            smooth = getattr(w, name, None)
+            if smooth is not None:
+                data = smooth.data.float()
+                if data.ndim == 1:
+                    data = data.unsqueeze(0)
+                # Official DSQ requires one row per group, even for a shared scale.
+                # Materialize once during preparation, never in forward/capture.
+                if name == "w2_smooth_scale" and data.shape[0] == 1:
+                    data = data.expand(int(w.num_local_experts), -1)
+                smooth.data = data.contiguous()
+        w._ascend_int8_moe_weights_processed = True
+
+    if plan.get("a2a_backend") != "ascend":
+        return
+    process_group = plan.get("ep_group") or plan.get("process_group")
+    if process_group is None:
+        raise ValueError("Ascend distributed MoE requires an EP process group")
+    backend = process_group._get_backend(w.w13_weight.device)
+    plan["ascend_hccl_group_name"] = backend.get_hccl_comm_name(int(w.ep_rank))
+
+    num_groups = int(plan.get("num_expert_groups", 1))
+    experts_per_group = plan.get("num_experts_per_group")
+    experts_per_group = (
+        int(w.num_experts) if experts_per_group is None else int(experts_per_group)
     )
-    w.w2_weight.data = _format_grouped_weight_nz(
-        w.w2_weight.data.transpose(-1, -2).contiguous()
-    )
-    w.w13_weight_scale.data = w.w13_weight_scale.data.float().contiguous()
-    w.w2_weight_scale.data = w.w2_weight_scale.data.contiguous()
-    for name in ("w13_smooth_scale", "w2_smooth_scale"):
-        smooth = getattr(w, name, None)
-        if smooth is not None:
-            data = smooth.data.float()
-            if data.ndim == 1:
-                data = data.unsqueeze(0)
-            # Official DSQ requires one row per group, even for a shared scale.
-            # Materialize once during preparation, never in forward/capture.
-            if name == "w2_smooth_scale" and data.shape[0] == 1:
-                data = data.expand(int(w.num_local_experts), -1)
-            smooth.data = data.contiguous()
-    w._ascend_int8_moe_weights_processed = True
+    if num_groups <= 0 or experts_per_group <= 0:
+        raise ValueError("Ascend distributed MoE group dimensions must be positive")
+    if num_groups * experts_per_group != int(w.num_experts):
+        raise ValueError("Ascend distributed MoE group dimensions mismatch weights")
+    if experts_per_group % int(w.ep_size):
+        raise ValueError("Ascend distributed MoE groups must divide across EP ranks")
+    groups_per_chunk = _MAX_A2_FULLMESH_EXPERTS // experts_per_group
+    if groups_per_chunk <= 0:
+        raise ValueError(
+            "One logical expert group exceeds the Ascend dispatch expert limit"
+        )
+    local_per_group = experts_per_group // int(w.ep_size)
+    chunks = []
+    for group_start in range(0, num_groups, groups_per_chunk):
+        chunk_groups = min(groups_per_chunk, num_groups - group_start)
+        local_start = group_start * local_per_group
+        local_count = chunk_groups * local_per_group
+        w13_smooth = getattr(w, "w13_smooth_scale", None)
+        w2_smooth = getattr(w, "w2_smooth_scale", None)
+        chunks.append(
+            SimpleNamespace(
+                group_start=group_start,
+                num_groups=chunk_groups,
+                num_experts=chunk_groups * experts_per_group,
+                num_local_experts=local_count,
+                hidden_size=int(w.hidden_size),
+                intermediate_size=int(w.intermediate_size),
+                ep_rank=int(w.ep_rank),
+                ep_size=int(w.ep_size),
+                w13_weight=w.w13_weight[local_start : local_start + local_count],
+                w2_weight=w.w2_weight[local_start : local_start + local_count],
+                w13_weight_scale=w.w13_weight_scale[
+                    local_start : local_start + local_count
+                ],
+                w2_weight_scale=w.w2_weight_scale[
+                    local_start : local_start + local_count
+                ],
+                w13_smooth_scale=(
+                    None
+                    if w13_smooth is None
+                    else (
+                        w13_smooth
+                        if w13_smooth.shape[0] == 1
+                        else w13_smooth[local_start : local_start + local_count]
+                    )
+                ),
+                w2_smooth_scale=(
+                    None
+                    if w2_smooth is None
+                    else w2_smooth[local_start : local_start + local_count]
+                ),
+                _ascend_int8_moe_weights_processed=True,
+            )
+        )
+    plan["ascend_expert_chunks"] = tuple(chunks)
 
 
 def _ascend_bf16_expert_gmm(
@@ -574,10 +641,212 @@ def ascend_bf16_distributed_precomputed_moe_apply(
     return torch.cat(outputs, dim=0)
 
 
+def _ascend_int8_expert_gmm_from_bf16(
+    expanded: torch.Tensor,
+    expert_counts: torch.Tensor,
+    w: torch.nn.Module,
+) -> torch.Tensor:
+    """Dynamic-quant BF16 tokens through local INT8 NZ expert GMMs."""
+    if expanded.numel() == 0:
+        return expanded
+    values, activation_scale = torch_npu.npu_dynamic_quant(expanded)
+    smooth13 = getattr(w, "w13_smooth_scale", None)
+    if smooth13 is not None:
+        # Per-token scales already absorbed activation; smooth is folded in
+        # the weight path for local routing. Distributed BF16 dispatch has no
+        # smooth quant; keep dynamic token scales only.
+        del smooth13
+    hidden = torch_npu.npu_grouped_matmul(
+        [values],
+        [w.w13_weight],
+        bias=None,
+        group_list=expert_counts,
+        split_item=3,
+        output_dtype=torch.int32,
+        group_type=0,
+        group_list_type=1,
+    )[0]
+    hidden, hidden_scale = torch_npu.npu_dequant_swiglu_quant(
+        hidden,
+        weight_scale=w.w13_weight_scale,
+        activation_scale=activation_scale,
+        bias=None,
+        quant_scale=getattr(w, "w2_smooth_scale", None),
+        quant_offset=None,
+        group_index=expert_counts,
+        activate_left=True,
+        quant_mode=1,
+    )
+    return torch_npu.npu_grouped_matmul(
+        [hidden],
+        [w.w2_weight],
+        scale=[w.w2_weight_scale],
+        per_token_scale=[hidden_scale.float()],
+        bias=None,
+        group_list=expert_counts,
+        split_item=3,
+        output_dtype=torch.bfloat16,
+        group_type=0,
+        group_list_type=1,
+    )[0]
+
+
+def ascend_int8_distributed_precomputed_moe_apply(
+    plan: dict,
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    num_tokens_global: int | None = None,
+    max_num_tokens_per_gpu: int | None = None,
+    do_finalize: bool = True,
+    enable_pdl: bool = False,
+    low_latency: bool | None = None,
+    overlap_fn=None,
+) -> torch.Tensor:
+    """Ascend MC2 dispatch of BF16 tokens, then local INT8 NZ expert GMMs."""
+    del router_logits, enable_pdl, low_latency
+    if overlap_fn is not None:
+        raise ValueError("Ascend distributed MoE does not support overlap_fn")
+    if not do_finalize:
+        raise ValueError("Ascend distributed MoE requires finalization")
+    if topk_weights is None or topk_ids is None:
+        raise ValueError("Ascend distributed MoE requires precomputed top-k")
+    if x.ndim != 2 or topk_ids.ndim != 2 or topk_weights.shape != topk_ids.shape:
+        raise ValueError("x and top-k tensors must be rank-2")
+    if topk_ids.shape[0] != x.shape[0] or topk_ids.shape[1] == 0:
+        raise ValueError("top-k tensors must have shape [tokens, top_k > 0]")
+    if x.dtype != torch.bfloat16 or x.device.type != "npu":
+        raise TypeError("Ascend distributed MoE requires BF16 NPU hidden states")
+    if not getattr(w, "_ascend_int8_moe_weights_processed", False):
+        raise RuntimeError("Ascend W8A8 MoE weights were not processed after loading")
+    group_name = plan.get("ascend_hccl_group_name")
+    if not group_name:
+        raise RuntimeError("Ascend distributed MoE has no HCCL communicator")
+
+    num_experts = int(w.num_experts)
+    num_zero_experts = int(plan.get("num_zero_experts", 0))
+    num_copy_experts = int(plan.get("num_copy_experts", 0))
+    num_groups = int(plan.get("num_expert_groups", 1))
+    experts_per_group = plan.get("num_experts_per_group")
+    experts_per_group = (
+        num_experts if experts_per_group is None else int(experts_per_group)
+    )
+    chunks = plan.get("ascend_expert_chunks")
+    if not chunks:
+        raise RuntimeError("Ascend distributed MoE expert chunks were not prepared")
+    if x.shape[0] % num_groups:
+        raise ValueError("Flattened grouped MoE tokens must divide by group count")
+    tokens_per_group = x.shape[0] // num_groups
+    local_per_group = experts_per_group // int(w.ep_size)
+    outputs = []
+    for chunk in chunks:
+        row_start = int(chunk.group_start) * tokens_per_group
+        row_count = int(chunk.num_groups) * tokens_per_group
+        chunk_x = x.narrow(0, row_start, row_count)
+        chunk_weights = topk_weights.narrow(0, row_start, row_count).float()
+        logical_ids = topk_ids.narrow(0, row_start, row_count).to(torch.int32)
+
+        is_real = (logical_ids >= 0) & (logical_ids < num_experts)
+        group_ids = torch.div(
+            logical_ids.clamp(0, num_experts - 1),
+            experts_per_group,
+            rounding_mode="floor",
+        )
+        expert_ids = logical_ids.remainder(experts_per_group)
+        owner = torch.div(expert_ids, local_per_group, rounding_mode="floor")
+        local_id = expert_ids.remainder(local_per_group)
+        physical_ids = (
+            owner * int(chunk.num_local_experts)
+            + (group_ids - int(chunk.group_start)) * local_per_group
+            + local_id
+        )
+        special_offset = logical_ids - num_experts
+        if num_zero_experts:
+            special_ids = int(chunk.num_experts) + special_offset.clamp(
+                0, num_zero_experts - 1
+            )
+        elif num_copy_experts:
+            special_ids = int(chunk.num_experts) + special_offset.clamp(
+                0, num_copy_experts - 1
+            )
+        else:
+            special_ids = logical_ids.remainder(int(chunk.num_experts))
+            chunk_weights = torch.where(
+                is_real, chunk_weights, torch.zeros_like(chunk_weights)
+            )
+        physical_ids = torch.where(is_real, physical_ids, special_ids).to(torch.int32)
+
+        chunk_global_tokens = 0
+        if num_tokens_global:
+            chunk_global_tokens = (
+                int(num_tokens_global) // num_groups * int(chunk.num_groups)
+            )
+        chunk_max_tokens = 0
+        if max_num_tokens_per_gpu:
+            chunk_max_tokens = (
+                int(max_num_tokens_per_gpu) // num_groups * int(chunk.num_groups)
+            )
+        global_bs = chunk_global_tokens
+        if chunk_max_tokens:
+            global_bs = chunk_max_tokens * int(w.ep_size)
+
+        dispatch = torch_npu.npu_moe_distribute_dispatch_v2(
+            x=chunk_x,
+            expert_ids=physical_ids,
+            expert_scales=chunk_weights,
+            group_ep=group_name,
+            group_tp="",
+            ep_world_size=int(w.ep_size),
+            tp_world_size=1,
+            ep_rank_id=int(w.ep_rank),
+            tp_rank_id=0,
+            moe_expert_num=int(chunk.num_experts),
+            shared_expert_num=0,
+            shared_expert_rank_num=0,
+            zero_expert_num=num_zero_experts,
+            copy_expert_num=num_copy_experts,
+            quant_mode=0,
+            global_bs=global_bs,
+            expert_token_nums_type=1,
+            comm_alg="fullmesh",
+        )
+        hidden = _ascend_int8_expert_gmm_from_bf16(dispatch[0], dispatch[3], chunk)
+        outputs.append(
+            torch_npu.npu_moe_distribute_combine_v2(
+                expand_x=hidden,
+                expert_ids=physical_ids,
+                assist_info_for_combine=dispatch[2],
+                ep_send_counts=dispatch[4],
+                tp_send_counts=dispatch[5],
+                expert_scales=chunk_weights,
+                expand_scales=dispatch[6],
+                ori_x=chunk_x,
+                group_ep=group_name,
+                group_tp="",
+                ep_world_size=int(w.ep_size),
+                tp_world_size=1,
+                ep_rank_id=int(w.ep_rank),
+                tp_rank_id=0,
+                moe_expert_num=int(chunk.num_experts),
+                shared_expert_num=0,
+                shared_expert_rank_num=0,
+                zero_expert_num=num_zero_experts,
+                copy_expert_num=num_copy_experts,
+                global_bs=global_bs,
+                comm_quant_mode=0,
+                comm_alg="fullmesh",
+            )
+        )
+    return torch.cat(outputs, dim=0)
+
+
 __all__ = [
     "ascend_bf16_distributed_precomputed_moe_apply",
     "ascend_bf16_precomputed_moe_apply",
     "ascend_bf16_process_moe_weights",
+    "ascend_int8_distributed_precomputed_moe_apply",
     "ascend_int8_precomputed_moe_apply",
     "ascend_int8_process_moe_weights",
     "ascend_softmax_bias_topk",

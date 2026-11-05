@@ -242,6 +242,19 @@ def v41_mxfp8_config(quant_config: QuantizationConfig | None) -> Mxfp8Config | N
     )
 
 
+def v41_dense_quant(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Dense quant for V4.1: Ascend W8A8 pass-through, else MXFP8 1x32 scales."""
+    if quant_config is None:
+        return None
+    from tokenspeed.runtime.layers.quantization.ascend import AscendQuantConfig
+
+    if isinstance(quant_config, AscendQuantConfig):
+        return quant_config
+    return v41_mxfp8_config(quant_config)
+
+
 class _V41Fp8Config(Mxfp8Config):
     """Select the reference dense method before Linear creates its parameters."""
 
@@ -462,6 +475,11 @@ def _column(input_size, output_size, dtype, quant_config, prefix, mapping):
     return layer
 
 
+def _on_accelerator(x: torch.Tensor) -> bool:
+    """CUDA or Ascend NPU — both have fused RMSNorm / linear leaves."""
+    return x.is_cuda or x.device.type == "npu"
+
+
 def _norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
     """RMSNorm in the reference cast order: FP32 scale, FP32 weight, one round."""
     if x.is_cuda:
@@ -476,7 +494,11 @@ def _norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
 
 
 def _attention_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
-    return norm(x, residual=None, out=None) if x.is_cuda else _norm(x, norm)
+    # Ratio-1 compressor and attention projections use the platform RMSNorm
+    # (Ascend ``npu_rms_norm`` via the layernorm registry on NPU).
+    return (
+        norm(x, residual=None, out=None) if _on_accelerator(x) else _norm(x, norm)
+    )
 
 
 def _merged(input_size, output_sizes, dtype, quant_config, prefix):
@@ -723,6 +745,7 @@ class DeepseekV41Compressor(nn.Module):
         if self.ratio == 1:
             content, _ = self.wkv(x, block_scale=None, output_dtype=None)
         else:
+            # Ascend has no dsv4_linear_fp32 leaf yet; NPU uses FP32 F.linear.
             projected = (
                 dsv4_linear_fp32(
                     x.contiguous(), self.wkv_wgate.weight, override=None, solution=None
@@ -1470,7 +1493,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         self.norm_eps, self.hc_eps = config.rms_norm_eps, config.hc_eps
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_stream_fork = StreamFork(hc_stream)
-        dense_quant = v41_mxfp8_config(quant_config)
+        dense_quant = v41_dense_quant(quant_config)
         self.attn = DeepseekV41Attention(
             config,
             mapping,
@@ -2709,7 +2732,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 skipped[reason] += 1
                 continue
             expert = re.fullmatch(
-                r"layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)", name
+                r"layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale|weight_scale|weight_offset)",
+                name,
             )
             if expert:
                 layer_id, expert_id = int(expert[1]), int(expert[2])
@@ -2723,27 +2747,46 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     if expert[3] == "w2"
                     else (config.moe_intermediate_size, config.hidden_size)
                 )
-                expected = (n, k // (32 if expert[4] == "scale" else 2))
+                field = expert[4]
+                # MXFP4 packs two codes per byte (K/2). Ascend W8A8 stores full
+                # int8 weights plus a per-channel scale and offset.
+                if field == "scale":
+                    expected = (n, k // 32)
+                elif field == "weight" and tensor.dtype == torch.int8:
+                    expected = (n, k)
+                elif field in ("weight_scale", "weight_offset"):
+                    expected = (n, 1) if tensor.ndim == 2 else (n,)
+                else:
+                    expected = (n, k // 2)
                 if tuple(tensor.shape) != expected:
                     raise ValueError(
                         f"{raw_name}: expected {expected}, got {tuple(tensor.shape)}"
                     )
-                allowed = (
-                    (torch.uint8, torch.float8_e8m0fnu)
-                    if expert[4] == "scale"
-                    else (torch.int8, torch.uint8, torch.float4_e2m1fn_x2)
-                )
+                if field == "scale":
+                    allowed = (torch.uint8, torch.float8_e8m0fnu)
+                elif field == "weight" and tensor.dtype == torch.int8:
+                    allowed = (torch.int8,)
+                elif field in ("weight_scale", "weight_offset"):
+                    allowed = (torch.float32, torch.bfloat16, torch.int32)
+                else:
+                    allowed = (torch.int8, torch.uint8, torch.float4_e2m1fn_x2)
                 if tensor.dtype not in allowed:
                     raise TypeError(
-                        f"{raw_name}: expected packed FP4/E8M0, got {tensor.dtype}"
+                        f"{raw_name}: expected packed FP4/E8M0 or Ascend W8A8, "
+                        f"got {tensor.dtype}"
                     )
                 local_count = config.n_routed_experts // self.mapping.moe.ep_size
                 if expert_id // local_count != self.mapping.moe.ep_rank:
                     skipped["remote_expert"] += 1
                     continue
-                if name not in targets:
+                if name not in targets and not name.endswith(
+                    (".weight_scale", ".weight_offset")
+                ):
                     raise ValueError(f"Unexpected V4.1 expert tensor: {raw_name}")
-                tensor = tensor.view(torch.uint8)
+                if tensor.dtype != torch.int8 and not name.endswith(
+                    (".weight_scale", ".weight_offset")
+                ):
+                    tensor = tensor.view(torch.uint8)
                 ffn = self.model.layers[layer_id].ffn
                 if ffn.use_mega_moe:
                     extra = ffn.experts.intermediate_size - config.moe_intermediate_size
@@ -2759,7 +2802,16 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                             mode="constant",
                             value=127 if expert[4] == "scale" else 0,
                         )
-                mapped = "model." + name.replace(".scale", ".weight_scale")
+                if name.endswith(".scale"):
+                    mapped = "model." + name[: -len(".scale")] + ".weight_scale"
+                else:
+                    mapped = "model." + name
+                # INT8 MoE stores per-channel scales, not a separate offset.
+                # A zero offset is the checkpoint's symmetric case.
+                if name.endswith(".weight_offset"):
+                    if mapped not in params and not bool(tensor.any()):
+                        loaded.add(name)
+                        continue
                 moe_loader.load(mapped, tensor)
             elif name.endswith((".attn.wo_a.weight", ".attn.wo_a.scale")):
                 weight_name = name.rsplit(".", 1)[0] + ".weight"
@@ -2818,6 +2870,10 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             else:
                 raise ValueError(f"Unexpected V4.1 checkpoint tensor: {raw_name}")
             loaded.add(name)
+            # Ascend W8A8 experts are named ``.weight_scale``. The coverage
+            # map still records the MXFP4 checkpoint constituent ``.scale``.
+            if name.endswith(".weight_scale"):
+                loaded.add(name.removesuffix(".weight_scale") + ".scale")
         self._load_missing_engram_tables(loaded)
         missing = set(targets) - loaded
         for key, pair in pending.items():
@@ -2847,11 +2903,25 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         from safetensors import safe_open
         from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-        index_path = os.path.join(checkpoint_dir, SAFE_WEIGHTS_INDEX_NAME)
-        if not os.path.isfile(index_path):
+        # HF packs use model.safetensors.index.json. Ascend modelslim packs
+        # keep the same weight_map in quant_model_weights.safetensors.index.json
+        # and point Engram tables at the standalone engram_embed_*.safetensors.
+        index_names = (
+            SAFE_WEIGHTS_INDEX_NAME,
+            "quant_model_weights.safetensors.index.json",
+        )
+        index_path = next(
+            (
+                os.path.join(checkpoint_dir, name)
+                for name in index_names
+                if os.path.isfile(os.path.join(checkpoint_dir, name))
+            ),
+            None,
+        )
+        if index_path is None:
             raise FileNotFoundError(
-                f"Engram slice load requires {SAFE_WEIGHTS_INDEX_NAME} in "
-                f"{checkpoint_dir}"
+                "Engram slice load requires one of "
+                f"{', '.join(index_names)} in {checkpoint_dir}"
             )
         with open(index_path) as handle:
             weight_map = json.load(handle)["weight_map"]
