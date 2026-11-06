@@ -1,0 +1,25 @@
+name: Sync upstream main
+
+on:
+  schedule:
+    # 09:00 Asia/Shanghai, daily. GitHub runs this in UTC and may delay it.
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Fast-forward main from upstream
+        run: |
+          git remote add upstream https://github.com/lightseekorg/tokenspeed.git
+          git fetch upstream main
+          git merge --ff-only upstream/main
+          git push origin main
