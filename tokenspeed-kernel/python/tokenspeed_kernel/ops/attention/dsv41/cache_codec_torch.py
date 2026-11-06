@@ -179,15 +179,6 @@ def _selected_byte_offsets(
     return page.unsqueeze(1) * int(page_stride) + cols.to(torch.int64)
 
 
-def _page_storage(flat: torch.Tensor) -> torch.Tensor:
-    """One byte-addressable span covering every page, including inter-page pad."""
-    page_stride = flat.stride(0)
-    if page_stride < flat.shape[1]:
-        raise ValueError("planar page stride is shorter than the page width")
-    span = (flat.shape[0] - 1) * page_stride + flat.shape[1]
-    return flat.as_strided((span,), (1,))
-
-
 def _column_indexes(slots: torch.Tensor, width: int, origin: int) -> torch.Tensor:
     page_row = (slots % _PAGE_ROWS).to(torch.int64).unsqueeze(1)
     return origin + page_row * width + torch.arange(
@@ -196,49 +187,70 @@ def _column_indexes(slots: torch.Tensor, width: int, origin: int) -> torch.Tenso
 
 
 def _transfer_selected(
-    storage: torch.Tensor, offsets: torch.Tensor, packed_cols: torch.Tensor, *, write: bool
+    flat: torch.Tensor,
+    slots: torch.Tensor,
+    cols: torch.Tensor,
+    packed_cols: torch.Tensor,
+    *,
+    write: bool,
 ) -> None:
-    if write:
-        storage[offsets] = packed_cols
+    """Copy selected columns one page at a time.
+
+    Indexing ``page * stride + col`` into the whole pool passes 2^31 bytes on
+    a real KV arena. NPU's index check then rejects the coordinate. Each page
+    is only ``flat.shape[1]`` bytes, so the index stays inside that page.
+    """
+    if slots.numel() == 0:
         return
-    packed_cols.copy_(storage[offsets])
+    page = torch.div(slots, _PAGE_ROWS, rounding_mode="floor")
+    for page_id in page.unique().tolist():
+        chosen = page == page_id
+        row = flat[int(page_id)]
+        if write:
+            row[cols[chosen]] = packed_cols[chosen]
+            continue
+        packed_cols[chosen] = row[cols[chosen]]
 
 
 def _write_planar(cache: torch.Tensor, slots: torch.Tensor, packed: torch.Tensor, cache_format: str) -> None:
     _, _, value_bytes, row_bytes = _layout(cache_format)
     scale_bytes = row_bytes - value_bytes
     flat = _flat_pages(cache, row_bytes)
-    storage = _page_storage(flat)
-    page_stride = flat.stride(0)
-    value_offsets = _selected_byte_offsets(
-        slots, _column_indexes(slots, value_bytes, 0), page_stride
+    _transfer_selected(
+        flat,
+        slots,
+        _column_indexes(slots, value_bytes, 0),
+        packed[:, :value_bytes],
+        write=True,
     )
-    scale_offsets = _selected_byte_offsets(
+    _transfer_selected(
+        flat,
         slots,
         _column_indexes(slots, scale_bytes, _PAGE_ROWS * value_bytes),
-        page_stride,
+        packed[:, value_bytes:],
+        write=True,
     )
-    _transfer_selected(storage, value_offsets, packed[:, :value_bytes], write=True)
-    _transfer_selected(storage, scale_offsets, packed[:, value_bytes:], write=True)
 
 
 def _read_planar(cache: torch.Tensor, slots: torch.Tensor, cache_format: str) -> torch.Tensor:
     _, _, value_bytes, row_bytes = _layout(cache_format)
     scale_bytes = row_bytes - value_bytes
     flat = _flat_pages(cache, row_bytes)
-    storage = _page_storage(flat)
-    page_stride = flat.stride(0)
     packed = cache.new_empty(slots.shape[0], row_bytes)
-    value_offsets = _selected_byte_offsets(
-        slots, _column_indexes(slots, value_bytes, 0), page_stride
+    _transfer_selected(
+        flat,
+        slots,
+        _column_indexes(slots, value_bytes, 0),
+        packed[:, :value_bytes],
+        write=False,
     )
-    scale_offsets = _selected_byte_offsets(
+    _transfer_selected(
+        flat,
         slots,
         _column_indexes(slots, scale_bytes, _PAGE_ROWS * value_bytes),
-        page_stride,
+        packed[:, value_bytes:],
+        write=False,
     )
-    _transfer_selected(storage, value_offsets, packed[:, :value_bytes], write=False)
-    _transfer_selected(storage, scale_offsets, packed[:, value_bytes:], write=False)
     return packed
 
 

@@ -99,6 +99,40 @@ def test_a2_block_alignment_pads_short_selections_and_keeps_visible_rows():
     assert align_pa_block_for_a2(wide).kv.shape[1] == 128
 
 
+def test_dense_selected_attention_ignores_unselected_rows():
+    torch.manual_seed(0)
+    q = torch.randn(2, 2, 4, dtype=torch.bfloat16)
+    kv = torch.randn(6, 4, dtype=torch.bfloat16)
+    indices = torch.tensor([[0, -1], [2, 1]], dtype=torch.int32)
+    sink = torch.tensor([0.0, 0.0])
+    got = _pages.selected_attention_dense(q, kv, indices, sink, 1.0, None, None)
+    assert got.shape == q.shape
+    poisoned = kv.clone()
+    poisoned[4:] = 9
+    again = _pages.selected_attention_dense(q, poisoned, indices, sink, 1.0, None, None)
+    assert torch.equal(got, again)
+    # One valid key and no sink: the output is that key.
+    q1 = torch.tensor([[[1.0, 0.0]]], dtype=torch.bfloat16)
+    kv1 = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.bfloat16)
+    out = _pages.selected_attention_dense(
+        q1, kv1, torch.tensor([[0, -1]]), None, 1.0, None, None
+    )
+    assert torch.allclose(out.float(), torch.tensor([[[1.0, 0.0]]]), atol=1e-2)
+
+
+def test_repeat_query_heads_keeps_the_live_heads():
+    q = torch.arange(2 * 2 * 4, dtype=torch.bfloat16).reshape(2, 2, 4)
+    sinks = torch.tensor([0.25, 0.5])
+    padded_q, padded_sinks = _pages.repeat_query_heads(q, sinks, 8)
+    assert padded_q.shape == (2, 8, 4)
+    assert padded_sinks.shape == (8,)
+    assert padded_q[:, :2].equal(q)
+    assert padded_sinks[:2].tolist() == [0.25, 0.5]
+    same_q, same_sinks = _pages.repeat_query_heads(q, sinks, 2)
+    assert same_q.shape == q.shape
+    assert same_sinks.tolist() == [0.25, 0.5]
+
+
 def test_adapt_flatkv_decode_selections_ratio2_residual():
     swa = torch.randn(2, 8, HEAD_DIM, dtype=torch.bfloat16)
     swa_lens = torch.tensor([8, 5], dtype=torch.int32)

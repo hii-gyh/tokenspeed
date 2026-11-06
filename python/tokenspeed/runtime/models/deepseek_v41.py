@@ -165,6 +165,14 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
 )
 from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MLP, DeepseekV4MoE
 from tokenspeed.runtime.models.deepseek_v41_vision import DeepseekV41Vision
+from tokenspeed.runtime.models.deepseek_v41_wide_ep import (
+    ced_narrowing_needs_row_exchange,
+    mapping_uses_wide_ep,
+    pad_token_dim,
+    restore_gathered_tokens,
+    split_replicated_tokens,
+    unpad_token_dim,
+)
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
@@ -1701,6 +1709,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             decode_hc
             and allow_ffn_reduce_fusion
             and not self.ffn.owns_ep_communication
+            and not mapping_uses_wide_ep(self.comm_manager.mapping)
             and self.comm_manager.moe_output_all_reduced(ctx)
             # All V4.1 norms share storage metadata. Admission only inspects
             # the layout; execution uses the consumer's own weight and epsilon.
@@ -1748,10 +1757,43 @@ class DeepseekV41DecoderLayer(nn.Module):
 
         With defer_reduce, the pending plain all-reduce over the MoE TPxEP
         group is left to the caller; admission guarantees one is required.
+        Wide EP never uses that all-reduce: each attention rank sends a
+        stride of the replicated batch, and the slices are gathered back
+        onto the attention group before the residual is added.
         """
+        wide_ep = mapping_uses_wide_ep(self.comm_manager.mapping)
+        wide_pad = 0
+        if wide_ep:
+            if defer_reduce:
+                raise ValueError("wide EP does not defer the MoE reduction")
+            if self.ffn.owns_ep_communication:
+                raise ValueError("wide EP does not use expert-owned communication")
+            attn = self.comm_manager.mapping.attn
+            x, wide_pad = pad_token_dim(x, attn.tp_size)
+            if image_mask is not None:
+                image_mask, _ = pad_token_dim(image_mask, attn.tp_size)
+            x = split_replicated_tokens(x, attn.tp_rank, attn.tp_size)
+            if image_mask is not None:
+                image_mask = split_replicated_tokens(
+                    image_mask, attn.tp_rank, attn.tp_size
+                )
+            total, maximum = x.shape[0], x.shape[0]
+            x = self.ffn(
+                x, image_mask, total, maximum, ctx=None, comm_manager=None, out=None
+            )
+            from tokenspeed.runtime.distributed.comm_ops import token_all_gather
+
+            gathered = token_all_gather(
+                x,
+                group=attn.tp_group,
+                scattered_num_tokens=[x.shape[0]] * attn.tp_size,
+            )
+            return unpad_token_dim(
+                restore_gathered_tokens(gathered, attn.tp_size), wide_pad
+            )
         # Fused EP returns this rank's rows, including an empty tensor on idle
         # ranks. HC residuals therefore stay local across dispatch/combine.
-        if self.ffn.owns_ep_communication:
+        elif self.ffn.owns_ep_communication:
             if defer_reduce:
                 raise ValueError(
                     "Expert-owned communication cannot defer its reduction"
@@ -1904,9 +1946,16 @@ class DeepseekV41Model(nn.Module):
             == mapping.moe.tp_size
             == 1
         )
-        if mapping.attn.tp_size != mapping.moe.tp_ep_size and not local_fused_ep:
+        wide_ep = mapping_uses_wide_ep(mapping)
+        if (
+            mapping.attn.tp_size != mapping.moe.tp_ep_size
+            and not local_fused_ep
+            and not wide_ep
+        ):
             raise NotImplementedError(
-                "V4.1 requires attention TP == MoE TPxEP or fused EP with attention/dense/MoE TP1"
+                "V4.1 requires attention TP == MoE TPxEP, fused EP with "
+                "attention/dense/MoE TP1, or attention TP over a world-sized "
+                "expert group with MoE TP 1"
             )
         if config.hc_mult != 4 or config.hc_sinkhorn_iters < 1:
             raise ValueError(
@@ -2189,10 +2238,11 @@ class DeepseekV41Model(nn.Module):
         view = backend.decoder_view()
         # Checked here, in the stage that always runs eagerly: a replayed
         # encoder graph would skip a check placed before it.
-        if (
-            view.keep_rows is not None
-            and ctx.global_num_tokens is not None
-            and not self.layers[start].ffn.owns_ep_communication
+        if ced_narrowing_needs_row_exchange(
+            keep_rows_present=view.keep_rows is not None,
+            has_global_token_counts=ctx.global_num_tokens is not None,
+            owns_ep_communication=self.layers[start].ffn.owns_ep_communication,
+            wide_ep=mapping_uses_wide_ep(self.layers[start].comm_manager.mapping),
         ):
             raise NotImplementedError(
                 "V4.1 CED narrowing under attention data parallelism needs the "
@@ -2836,8 +2886,14 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                         else module.output_sizes[shard_id]
                     )
                     expected = (n, module.input_size)
-                    if name.endswith(".scale"):
-                        expected = tuple((dim + 31) // 32 for dim in expected)
+                    if name.endswith(".weight"):
+                        expected = (n, module.input_size)
+                    elif name.endswith(".scale"):
+                        expected = tuple(
+                            (dim + 31) // 32 for dim in (n, module.input_size)
+                        )
+                    elif name.endswith((".weight_scale", ".weight_offset")):
+                        expected = (n, 1) if param.ndim == 2 else (n,)
                 elif isinstance(module, VocabParallelEmbedding):
                     expected = (module.num_embeddings, module.embedding_dim)
                 elif name.endswith(".attn_sink"):
@@ -2854,11 +2910,21 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                         f"{raw_name}: expected checkpoint FP8 E4M3, got {tensor.dtype}"
                     )
                 if not expects_fp8 and not name.endswith(".scale"):
-                    fp32 = ".hc_" in name or name.endswith(
-                        (".attn_sink", ".ffn.gate.bias", ".ffn.gate.bias_vl")
-                    )
-                    dtype = torch.float32 if fp32 else torch.bfloat16
-                    if tensor.dtype != dtype:
+                    if param.dtype == torch.int8:
+                        dtype = torch.int8
+                    elif name.endswith((".weight_scale", ".weight_offset")):
+                        if tensor.dtype not in (torch.float32, param.dtype):
+                            raise TypeError(
+                                f"{raw_name}: expected float32 Ascend scale/offset, "
+                                f"got {tensor.dtype}"
+                            )
+                        dtype = None
+                    else:
+                        fp32 = ".hc_" in name or name.endswith(
+                            (".attn_sink", ".ffn.gate.bias", ".ffn.gate.bias_vl")
+                        )
+                        dtype = torch.float32 if fp32 else torch.bfloat16
+                    if dtype is not None and tensor.dtype != dtype:
                         raise TypeError(
                             f"{raw_name}: expected {dtype}, got {tensor.dtype}"
                         )

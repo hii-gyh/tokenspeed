@@ -76,6 +76,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_GROUP_GEOMETRY,
     V41_PREFILL_QUERY_TILE,
     V41_SWA_GROUP_ID,
+    V41_WINDOW_SIZE,
     v41_table_widths,
 )
 from tokenspeed.runtime.layers.attention.deepseek_v41_kvp import (
@@ -1096,7 +1097,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         # Read before any writes: a scheduler-reused tail page must not destroy
         # the odd-prefix input needed by the first completed pair in this chunk.
         tail = self.cache_pool.compressor_tail(owner)
-        if content.is_cuda:
+        on_accelerator = content.is_cuda or content.device.type == "npu"
+        if on_accelerator:
             from tokenspeed_kernel.ops.attention import dsv41
 
             pooled = dsv41.compressor_pool(
@@ -1110,38 +1112,36 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 norm_weight,
                 norm_eps,
             )
-        else:
-            missing = active & (previous < 0)
-            pooled = torch.empty_like(content)
-            for start in range(0, positions.numel(), 8):
-                stop = min(start + 8, positions.numel())
-                slot = slots[start:stop].clamp_min(0)
-                history = tail[slot // 2, slot % 2]
-                prior = previous[start:stop].clamp_min(0)
-                prior_content = torch.where(
-                    missing[start:stop, None], history[:, 0], content[prior]
-                )
-                prior_scores = torch.where(
-                    missing[start:stop, None], history[:, 1], scores[prior]
-                )
-                weights = torch.stack(
-                    (prior_scores, scores[start:stop]), dim=1
-                ).softmax(1)
-                pooled[start:stop] = (
-                    weights[:, 0] * prior_content + weights[:, 1] * content[start:stop]
-                ).masked_fill(~active[start:stop, None], 0)
-        if not content.is_cuda and norm_weight is not None:
+            dsv41.compressor_tail_scatter(content, scores, tail, write_slots)
+            return pooled, pair_positions, pair_requests
+        missing = active & (previous < 0)
+        pooled = torch.empty_like(content)
+        for start in range(0, positions.numel(), 8):
+            stop = min(start + 8, positions.numel())
+            slot = slots[start:stop].clamp_min(0)
+            history = tail[slot // 2, slot % 2]
+            prior = previous[start:stop].clamp_min(0)
+            prior_content = torch.where(
+                missing[start:stop, None], history[:, 0], content[prior]
+            )
+            prior_scores = torch.where(
+                missing[start:stop, None], history[:, 1], scores[prior]
+            )
+            weights = torch.stack(
+                (prior_scores, scores[start:stop]), dim=1
+            ).softmax(1)
+            pooled[start:stop] = (
+                weights[:, 0] * prior_content + weights[:, 1] * content[start:stop]
+            ).masked_fill(~active[start:stop, None], 0)
+        if norm_weight is not None:
             normalized = pooled.to(torch.bfloat16).float()
             normalized = normalized * torch.rsqrt(
                 normalized.square().mean(-1, keepdim=True) + norm_eps
             )
             pooled = (normalized * norm_weight.float()).to(torch.bfloat16)
-        if content.is_cuda:
-            dsv41.compressor_tail_scatter(content, scores, tail, write_slots)
-        else:
-            live = write_slots >= 0
-            tail[write_slots[live] // 2, write_slots[live] % 2, 0] = content[live]
-            tail[write_slots[live] // 2, write_slots[live] % 2, 1] = scores[live]
+        live = write_slots >= 0
+        tail[write_slots[live] // 2, write_slots[live] % 2, 0] = content[live]
+        tail[write_slots[live] // 2, write_slots[live] % 2, 1] = scores[live]
         return pooled, pair_positions, pair_requests
 
     def write_global(
@@ -1824,6 +1824,62 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 self._decode_schedule_keepalive.append(schedule)
         return schedule
 
+    def _forward_v41_ascend_decode(
+        self,
+        q,
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        global_cache,
+        global_slots,
+        global_lens,
+        attn_sink,
+        softmax_scale: float,
+        *,
+        owner: int,
+        request_indices,
+        forward_mode: ForwardMode,
+    ) -> torch.Tensor:
+        """Gather FlatKV slots to BF16 PA_BBND blocks and run Ascend sparse MLA.
+
+        Packed LCM pages stay the single cache geometry; the page adapter
+        materializes only the selected SWA/global rows into the Ascend op's
+        PA_BBND ABI. KVP-sharded decode keeps the CUDA combine path above.
+        """
+        from tokenspeed_kernel.ops.attention import dsv41
+        from tokenspeed_kernel.ops.attention.dsv41.ascend import (
+            ascend_selected_attention_from_flatkv_rows,
+        )
+
+        swa_rows = dsv41.cache_gather(swa_cache, swa_slots, self.swa_format, None)
+        global_rows = None
+        cmp_ratio = 0
+        if owner >= 0:
+            if global_cache is None or global_slots is None or global_lens is None:
+                raise RuntimeError("V4.1 Ascend decode is missing global selection")
+            global_rows = dsv41.cache_gather(
+                global_cache, global_slots, self.global_format, None
+            )
+            cmp_ratio = int(self.spec.compress_ratios[owner])
+        meta = self.query_metadata(forward_mode)
+        # Live request lengths drive ratio-2 residual; decode rows index them.
+        seq_lens = meta.seq_lens.to(torch.int32)[
+            request_indices.to(torch.int64)
+        ].contiguous()
+        return ascend_selected_attention_from_flatkv_rows(
+            q,
+            swa_rows=swa_rows,
+            swa_lens=swa_lens,
+            global_rows=global_rows,
+            global_lens=global_lens,
+            attn_sink=attn_sink,
+            softmax_scale=softmax_scale,
+            cmp_ratio=cmp_ratio,
+            seq_lens=seq_lens,
+            ori_win_left=V41_WINDOW_SIZE - 1,
+            ori_win_right=0,
+        )
+
     def forward_v41(
         self,
         q,
@@ -2035,6 +2091,26 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     rank=self.kvp_rank,
                     sink=attn_sink[:heads],
                     keep_all_heads=False,
+                )
+                if out_rope_cache is not None:
+                    dsv41.rope_inplace(out, positions, out_rope_cache, None)
+                return out
+            from tokenspeed_kernel.platform import current_platform
+
+            if current_platform().is_npu:
+                out = self._forward_v41_ascend_decode(
+                    q,
+                    cache,
+                    swa_slots,
+                    swa_lens,
+                    global_cache,
+                    global_slots,
+                    global_lens,
+                    attn_sink,
+                    softmax_scale,
+                    owner=owner,
+                    request_indices=request_indices,
+                    forward_mode=forward_mode,
                 )
                 if out_rope_cache is not None:
                     dsv41.rope_inplace(out, positions, out_rope_cache, None)

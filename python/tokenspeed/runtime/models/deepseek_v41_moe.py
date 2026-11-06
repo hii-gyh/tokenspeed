@@ -49,6 +49,7 @@ from tokenspeed.runtime.layers.moe.topk import (
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.models.deepseek_v41_wide_ep import mapping_uses_wide_ep
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -235,6 +236,11 @@ def _deepseek_v4_routed_expert_quant_config(
     # ``quant_method=fp8`` describes the model-wide quantization, but DeepSeek
     # V4 can still serialize routed experts as packed MXFP4. Prefer the explicit
     # expert contract so packed FP4 tensors are never allocated as block FP8.
+    # Ascend modelslim W8A8 keeps the checkpoint quant config for INT8 experts.
+    from tokenspeed.runtime.layers.quantization.ascend import AscendQuantConfig
+
+    if isinstance(quant_config, AscendQuantConfig):
+        return quant_config, False
     is_block_fp8 = isinstance(quant_config, Fp8Config) and (
         getattr(config, "expert_dtype", None) != "fp4"
     )
@@ -310,10 +316,14 @@ class DeepseekV4MoE(nn.Module):
                     "DeepSeek V4 normal EP does not support redundant experts "
                     "with precomputed routing."
                 )
-            if mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size):
+            if (
+                mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size)
+                and not mapping_uses_wide_ep(mapping)
+            ):
                 raise ValueError(
                     "DeepSeek V4 normal EP requires attention TP size 1 or "
-                    "attention TP size equal to the MoE TPxEP size."
+                    "attention TP size equal to the MoE TPxEP size, unless "
+                    "expert parallel covers the whole world and MoE TP is 1."
                 )
             if config.hidden_size % 256:
                 raise ValueError(
@@ -337,9 +347,14 @@ class DeepseekV4MoE(nn.Module):
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 reduce_results=False,
                 # Normal EP sums routed and shared partials over the same TPxEP
-                # group. Fused MegaMoE paths return complete routed outputs and
+                # group. Wide EP keeps the shared expert on the attention TP
+                # group: the expert group is wider and holds other replicas.
+                # Fused MegaMoE paths return complete routed outputs and
                 # therefore keep the shared expert dense and local.
-                is_shared_expert=not (self.use_mega_moe or self.use_gluon_petit),
+                is_shared_expert=(
+                    not (self.use_mega_moe or self.use_gluon_petit)
+                    and not mapping_uses_wide_ep(mapping)
+                ),
             )
         else:
             self.shared_experts = None

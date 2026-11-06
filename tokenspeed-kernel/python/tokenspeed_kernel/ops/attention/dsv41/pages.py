@@ -172,6 +172,80 @@ def align_pa_block_for_a2(selection: PaBbndSelection) -> PaBbndSelection:
     return PaBbndSelection(kv, selection.block_table, indices, selection.topk_length)
 
 
+def repeat_query_heads(
+    q: torch.Tensor, sinks: torch.Tensor, target: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Repeat query heads up to ``target`` so A2 vector tiles stay in range.
+
+    Sparse MLA's A2 example launches 64 query heads. Tensor-parallel ranks can
+    hold fewer. Repeating heads does not change the first ``live`` heads, which
+    the caller slices back off.
+    """
+    if q.ndim != 3:
+        raise ValueError(f"query must be [tokens, heads, dim], got {tuple(q.shape)}")
+    live = int(q.shape[1])
+    if live < 1 or target < live:
+        raise ValueError(f"cannot repeat {live} query heads to {target}")
+    sinks = sinks.detach().float().reshape(-1)
+    if sinks.numel() < live:
+        raise ValueError(
+            f"sparse MLA sinks has {sinks.numel()} values for {live} query heads"
+        )
+    sinks = sinks[:live].contiguous()
+    if live == target:
+        return q, sinks
+    reps = (target + live - 1) // live
+    return (
+        q.repeat(1, reps, 1)[:, :target].contiguous(),
+        sinks.repeat(reps)[:target].contiguous(),
+    )
+
+
+def selected_attention_dense(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    out: torch.Tensor | None,
+    lse: torch.Tensor | None,
+) -> torch.Tensor:
+    """Score ``q`` against selected rows of a dense BF16 key workspace.
+
+    ``indices`` addresses the row axis of ``kv``. Negative indices contribute
+    nothing. Only those rows are read, so a larger unused workspace does not
+    enter the softmax.
+    """
+    if kv.ndim == 3:
+        kv = kv.squeeze(1)
+    tokens, heads, _ = q.shape
+    width = indices.shape[-1]
+    safe = indices.clamp_min(0).long()
+    valid = indices >= 0
+    gathered = kv[safe]
+    gathered = gathered.masked_fill(~valid[..., None], 0)
+    scores = torch.einsum("thd,twd->thw", q.float(), gathered.float()) * float(
+        softmax_scale
+    )
+    scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
+    if attn_sink is not None:
+        sink = attn_sink.to(torch.float32).view(1, heads, 1).expand(tokens, -1, 1)
+        scores = torch.cat((scores, sink), dim=-1)
+    probs = torch.softmax(scores, dim=-1)
+    if attn_sink is not None:
+        probs = probs[..., :-1]
+    probs = probs.masked_fill(~valid[:, None, :], 0)
+    result = torch.einsum("thw,twd->thd", probs, gathered.float()).to(q.dtype)
+    if out is None:
+        out = result
+    else:
+        out.copy_(result)
+    if lse is not None:
+        base = scores[..., :width] if attn_sink is not None else scores
+        lse.copy_(torch.logsumexp(base, dim=-1))
+    return out
+
+
 def materialize_bf16_rows_as_pa_bbnd(
     rows: torch.Tensor, lengths: torch.Tensor
 ) -> PaBbndSelection:

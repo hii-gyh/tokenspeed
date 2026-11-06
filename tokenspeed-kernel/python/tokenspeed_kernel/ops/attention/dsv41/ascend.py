@@ -44,6 +44,8 @@ from tokenspeed_kernel.ops.attention.dsv41.pages import (
     align_pa_block_for_a2,
     decode_cu_seqlens_q,
     pad_sparse_indices,
+    repeat_query_heads,
+    selected_attention_dense,
 )
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -59,9 +61,12 @@ if current_platform().is_npu:
     _FP32_SIG = frozenset({format_signature(x=dense_tensor_format(torch.float32))})
     _BYTE_SIG = frozenset({format_signature(x=dense_tensor_format(torch.uint8))})
     _BF16_SIG = frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))})
-    # This CANN build's SparseFlashMla checks metadata.shape[0] == 2048.
-    # npu_sparse_flash_mla_metadata on the same image returns 1024.
+    # The metadata kernel writes 1024 int32s. The installed attention op
+    # rejects that and requires dim 0 == 2048, so the tail is zero-filled.
     _SPARSE_MLA_METADATA_LEN = 2048
+    # The A2 example launches 64 query heads. TP ranks may hold fewer; the
+    # vector tiles are 16-wide, so repeat up to the example width and slice back.
+    _SPARSE_MLA_QUERY_HEADS = 64
 
     def _pad_sparse_mla_metadata(metadata: torch.Tensor) -> torch.Tensor:
         if metadata.shape[0] == _SPARSE_MLA_METADATA_LEN:
@@ -196,55 +201,63 @@ if current_platform().is_npu:
         ori_win_right: int,
     ) -> torch.Tensor:
         tokens = q.shape[0]
-        heads = q.shape[1]
-        if heads < 1 or q.shape[-1] != 512:
+        live_heads = q.shape[1]
+        if live_heads < 1 or q.shape[-1] != 512:
             raise ValueError(
                 f"sparse MLA query must be [tokens, heads, 512], got {tuple(q.shape)}"
             )
+        q, sinks = repeat_query_heads(q, attn_sink, _SPARSE_MLA_QUERY_HEADS)
+        heads = q.shape[1]
         ori = align_pa_block_for_a2(ori)
         if cmp is not None:
             cmp = align_pa_block_for_a2(cmp)
+        block_rows = int(ori.kv.shape[1])
         cu_seqlens_q = decode_cu_seqlens_q(tokens, device=q.device)
-        seqused_ori = swa_lens_as_seqused(ori.topk_length)
+        seqused_ori = (
+            swa_lens_as_seqused(ori.topk_length).to(torch.int32).clamp(0, block_rows)
+        )
         seqused_cmp = (
-            swa_lens_as_seqused(cmp.topk_length) if cmp is not None else None
+            swa_lens_as_seqused(cmp.topk_length)
+            .to(torch.int32)
+            .clamp(0, int(cmp.kv.shape[1]))
+            if cmp is not None
+            else None
         )
         # A2/A3 SparseFlashMla binaries only compile SWA and CSA templates.
         # ori_mask_mode 0 with a non-zero ori_topk selects ORI_SPARSE, which
         # has no A2 tiling key. Compact rows are already the selected window,
         # so the causal band (mode 4, ori_topk 0) matches vLLM's SWA path.
-        # The same image passes the model compress ratio (0, 1, or 2) into
-        # both metadata and the attention op; A2 block size must be a multiple
-        # of 16 in [16, 1024]. The window stays the caller's sliding window.
+        # cmp_topk is the compact block width, never larger than max_seqlen:
+        # the metadata kernel indexes those positions into the sequence.
         has_cmp = cmp is not None
         ori_mask_mode = 4
         cmp_mask_mode = 3 if has_cmp else 0
-        block_rows = int(ori.kv.shape[1])
         win_left = max(int(ori_win_left), 0)
         win_right = max(int(ori_win_right), 0)
-        _ASCEND_TOPK = 512
         cmp_sparse = None
         cmp_topk = 0
+        max_seqlen_cmp = 0
         if has_cmp:
-            cmp_topk = _ASCEND_TOPK
-            width = int(cmp.sparse_indices.shape[-1])
-            if width > cmp_topk:
-                raise ValueError(
-                    f"compressed sparse width {width} exceeds Ascend cmp_topk {cmp_topk}"
-                )
-            if width == cmp_topk:
-                cmp_sparse = cmp.sparse_indices
-            else:
-                cmp_sparse = pad_sparse_indices(
-                    cmp.sparse_indices.squeeze(1), cmp_topk
-                )
+            max_seqlen_cmp = int(cmp.kv.shape[1])
+            cmp_topk = max_seqlen_cmp
+            cmp_sparse = cmp.sparse_indices
             # cmp_mask_mode 3 with cmp_ratio other than 1 requires a residual
             # vector. Ratio-1 layers have none; zeros mean the compressed
             # block already covers the sequence.
             if residual is None:
-                residual = torch.zeros(
-                    tokens, dtype=torch.int32, device=q.device
-                )
+                residual = torch.zeros(tokens, dtype=torch.int32, device=q.device)
+        ori_max = int(seqused_ori.max()) if seqused_ori.numel() else 0
+        cmp_max = int(seqused_cmp.max()) if seqused_cmp is not None and seqused_cmp.numel() else 0
+        print(
+            "[smla] "
+            f"tokens={tokens} live_heads={live_heads} heads={heads} "
+            f"has_cmp={has_cmp} cmp_ratio={0 if not has_cmp else int(cmp_ratio)} "
+            f"block_rows={block_rows} max_cmp={max_seqlen_cmp} cmp_topk={cmp_topk} "
+            f"win={win_left},{win_right} ori_max={ori_max} cmp_max={cmp_max}",
+            flush=True,
+        )
+        if ori_max <= 0 and cmp_max <= 0:
+            return q.new_zeros((tokens, live_heads, q.shape[-1]))
         metadata = npu_sparse_flash_mla_metadata(
             heads,
             1,
@@ -256,7 +269,7 @@ if current_platform().is_npu:
             batch_size=tokens,
             max_seqlen_q=1,
             max_seqlen_ori_kv=block_rows,
-            max_seqlen_cmp_kv=int(cmp.kv.shape[1]) if has_cmp else 0,
+            max_seqlen_cmp_kv=max_seqlen_cmp,
             ori_topk=0,
             ori_topk_length=None,
             cmp_topk=cmp_topk,
@@ -288,8 +301,7 @@ if current_platform().is_npu:
             seqused_ori_kv=seqused_ori,
             seqused_cmp_kv=seqused_cmp,
             cmp_residual_kv=residual,
-            # Ascend op requires rank-1 sinks of length ``num_heads``.
-            sinks=attn_sink.detach().float().reshape(-1)[:heads].contiguous(),
+            sinks=sinks,
             metadata=_pad_sparse_mla_metadata(metadata),
             softmax_scale=softmax_scale,
             cmp_ratio=kernel_cmp_ratio,
@@ -298,7 +310,7 @@ if current_platform().is_npu:
             ori_win_left=win_left,
             ori_win_right=win_right,
         )
-        return out
+        return out[:, :live_heads]
 
     def swa_lens_as_seqused(topk_length: torch.Tensor) -> torch.Tensor:
         """Flatten ``[T, 1]`` topk lengths to the ``[T]`` seqused vector."""
@@ -468,49 +480,15 @@ if current_platform().is_npu:
             out,
         )
 
-    def _selected_attention_dense(
-        q, kv, indices, attn_sink, softmax_scale, out, lse
-    ):
-        """MLA selected attention over a dense BF16 key workspace."""
-        if kv.ndim == 3:
-            kv = kv.squeeze(1)
-        tokens, heads, dim = q.shape
-        width = indices.shape[-1]
-        safe = indices.clamp_min(0).long()
-        valid = indices >= 0
-        gathered = kv[safe]  # [T, W, 512]
-        gathered = gathered.masked_fill(~valid[..., None], 0)
-        # scores [T, H, W]
-        scores = torch.einsum("thd,twd->thw", q.float(), gathered.float()) * float(
-            softmax_scale
-        )
-        scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
-        if attn_sink is not None:
-            # Append sink as an extra logit column, then drop it after softmax.
-            sink = attn_sink.to(torch.float32).view(1, heads, 1).expand(tokens, -1, 1)
-            scores = torch.cat((scores, sink), dim=-1)
-        probs = torch.softmax(scores, dim=-1)
-        if attn_sink is not None:
-            probs = probs[..., :-1]
-        probs = probs.masked_fill(~valid[:, None, :], 0)
-        result = torch.einsum("thw,twd->thd", probs, gathered.float()).to(q.dtype)
-        if out is None:
-            out = result
-        else:
-            out.copy_(result)
-        if lse is not None:
-            # Natural-log LSE without the sink column.
-            base = scores[..., :width] if attn_sink is not None else scores
-            lse.copy_(torch.logsumexp(base, dim=-1))
-        return out
-
     @register_kernel(
         "attention",
         "dsv41_selected_attention",
         name="ascend_dsv41_selected_attention",
         solution="torch_npu",
         capability=_CAPABILITY,
-        signatures=format_signatures("q", "dense", {torch.bfloat16}),
+        signatures=frozenset(
+            {format_signature(x=dense_tensor_format(torch.bfloat16))}
+        ),
         traits={"flashmla_eligible": frozenset({False})},
         priority=Priority.SPECIALIZED,
         features={"ascend", "flatkv"},
@@ -540,7 +518,7 @@ if current_platform().is_npu:
         if prefill_kv is not None:
             if prefill_indices is None:
                 raise ValueError("prefill_kv requires prefill_indices")
-            return _selected_attention_dense(
+            return selected_attention_dense(
                 q, prefill_kv, prefill_indices, attn_sink, softmax_scale, out, lse
             )
         if prefill_indices is not None:
