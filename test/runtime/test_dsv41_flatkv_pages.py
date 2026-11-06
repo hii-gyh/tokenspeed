@@ -183,3 +183,56 @@ def test_pad_and_compact_helpers():
     ]
     assert cmp_residual_kv(torch.tensor([5, 4]), 2).tolist() == [1, 0]
     assert cmp_residual_kv(torch.tensor([5, 4]), 1) is None
+
+
+def test_prefill_workspace_matches_the_dense_key_set():
+    kv = torch.randn(6, HEAD_DIM, dtype=torch.bfloat16)
+    indices = torch.tensor(
+        [[0, -1, 2, 4, -1], [1, -1, -1, -1, -1]], dtype=torch.int32
+    )
+    seq_lens = torch.tensor([8, 9], dtype=torch.int32)
+    ori, cmp, residual = _pages.prefill_workspace_selections(
+        kv, indices, 3, 2, seq_lens
+    )
+    assert residual.tolist() == [0, 1]
+    assert ori.topk_length.view(-1).tolist() == [2, 1]
+    assert cmp is not None
+    assert cmp.topk_length.view(-1).tolist() == [1, 0]
+    assert torch.equal(ori.kv[0, :2, 0], kv[[0, 2]])
+    assert torch.equal(ori.kv[1, :1, 0], kv[[1]])
+    assert torch.equal(cmp.kv[0, :1, 0], kv[[4]])
+    # The compact width is the longest selected run, not the workspace.
+    assert ori.kv.shape[1] == 2
+    assert ori.kv.shape[1] < kv.shape[0]
+    poisoned = kv.clone()
+    poisoned[3] = 9
+    poisoned[5] = 9
+    ori_poison, cmp_poison, _ = _pages.prefill_workspace_selections(
+        poisoned, indices, 3, 2, seq_lens
+    )
+    assert torch.equal(ori.kv, ori_poison.kv)
+    assert torch.equal(cmp.kv, cmp_poison.kv)
+    q = torch.randn(2, 1, HEAD_DIM, dtype=torch.bfloat16)
+    dense = _pages.selected_attention_dense(q, kv, indices, None, 1.0, None, None)
+    token0 = _pages.selected_attention_dense(
+        q[:1],
+        torch.stack((kv[0], kv[2], kv[4])),
+        torch.tensor([[0, 1, 2]]),
+        None,
+        1.0,
+        None,
+        None,
+    )
+    token1 = _pages.selected_attention_dense(
+        q[1:], kv[1:2], torch.tensor([[0]]), None, 1.0, None, None
+    )
+    assert torch.allclose(dense[:1].float(), token0.float(), atol=1e-2, rtol=1e-2)
+    assert torch.allclose(dense[1:].float(), token1.float(), atol=1e-2, rtol=1e-2)
+    aligned = align_pa_block_for_a2(ori)
+    assert aligned.kv.shape[1] % 16 == 0
+    assert aligned.sparse_indices.shape[-1] == aligned.kv.shape[1]
+    swa_only, no_cmp, no_residual = _pages.prefill_workspace_selections(
+        kv, indices[:, :3], 3, 0, seq_lens
+    )
+    assert no_cmp is None and no_residual is None
+    assert swa_only.topk_length.view(-1).tolist() == [2, 1]

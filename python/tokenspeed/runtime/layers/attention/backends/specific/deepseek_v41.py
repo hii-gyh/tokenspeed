@@ -2240,57 +2240,83 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             # copy their compact result back explicitly after native execution.
             output = out[rows] if isinstance(rows, slice) else None
             request_q = q[rows].contiguous()
-            group = self.spec.attention_query_group
-            if (
-                canonical
-                and q.is_cuda
-                and index_process_group is None
-                and should_exchange_prefill_heads(
-                    num_queries=request_q.shape[0],
-                    local_heads=request_q.shape[1],
-                    group_size=len(group),
-                    min_queries=self.spec.attention_query_min_tokens,
-                    swa_min_queries=self.spec.attention_query_swa_min_tokens,
-                    has_global=owner >= 0,
+            from tokenspeed_kernel.platform import current_platform
+
+            if current_platform().is_npu:
+                from tokenspeed_kernel.ops.attention.dsv41.ascend import (
+                    ascend_prefill_attention_from_workspace,
                 )
-            ):
-                if layer_id not in self._attention_exchange_layers:
-                    logging.getLogger(__name__).info(
-                        f"V4.1 prefill attention QCP: layer={layer_id}, "
-                        f"size={len(group)}, rows={request_q.shape[0]}, "
-                        f"local_heads={request_q.shape[1]}"
-                    )
-                    self._attention_exchange_layers.add(layer_id)
-                result = selected_prefill_with_head_exchange(
+
+                query_positions = positions[rows]
+                result = ascend_prefill_attention_from_workspace(
                     request_q,
-                    workspace[:, None, :],
-                    indices,
-                    attn_sink,
+                    workspace,
+                    indices.contiguous(),
+                    swa_width=request_plan.swa_indices.shape[-1],
+                    attn_sink=attn_sink,
                     softmax_scale=softmax_scale,
-                    query_chunk_size=V41_PREFILL_QUERY_TILE,
-                    group=group,
-                    rank=self.spec.attention_query_rank,
+                    cmp_ratio=(
+                        0
+                        if owner < 0
+                        else int(self.spec.compress_ratios[owner])
+                    ),
+                    seq_lens=(query_positions.to(torch.int32) + 1).reshape(-1),
+                    ori_win_left=V41_WINDOW_SIZE - 1,
                 )
                 if output is not None:
                     output.copy_(result)
             else:
-                result = dsv41.selected_attention(
-                    request_q,
-                    cache,
-                    None,
-                    None,
-                    global_cache,
-                    None,
-                    None,
-                    attn_sink,
-                    softmax_scale,
-                    output,
-                    V41_PREFILL_QUERY_TILE,
-                    None,
-                    workspace[:, None, :],
-                    indices.contiguous(),
-                    lse=None,
-                )
+                group = self.spec.attention_query_group
+                if (
+                    canonical
+                    and q.is_cuda
+                    and index_process_group is None
+                    and should_exchange_prefill_heads(
+                        num_queries=request_q.shape[0],
+                        local_heads=request_q.shape[1],
+                        group_size=len(group),
+                        min_queries=self.spec.attention_query_min_tokens,
+                        swa_min_queries=self.spec.attention_query_swa_min_tokens,
+                        has_global=owner >= 0,
+                    )
+                ):
+                    if layer_id not in self._attention_exchange_layers:
+                        logging.getLogger(__name__).info(
+                            f"V4.1 prefill attention QCP: layer={layer_id}, "
+                            f"size={len(group)}, rows={request_q.shape[0]}, "
+                            f"local_heads={request_q.shape[1]}"
+                        )
+                        self._attention_exchange_layers.add(layer_id)
+                    result = selected_prefill_with_head_exchange(
+                        request_q,
+                        workspace[:, None, :],
+                        indices,
+                        attn_sink,
+                        softmax_scale=softmax_scale,
+                        query_chunk_size=V41_PREFILL_QUERY_TILE,
+                        group=group,
+                        rank=self.spec.attention_query_rank,
+                    )
+                    if output is not None:
+                        output.copy_(result)
+                else:
+                    result = dsv41.selected_attention(
+                        request_q,
+                        cache,
+                        None,
+                        None,
+                        global_cache,
+                        None,
+                        None,
+                        attn_sink,
+                        softmax_scale,
+                        output,
+                        V41_PREFILL_QUERY_TILE,
+                        None,
+                        workspace[:, None, :],
+                        indices.contiguous(),
+                        lse=None,
+                    )
             if output is None:
                 out[rows] = result
             del workspace, current_rows, indices

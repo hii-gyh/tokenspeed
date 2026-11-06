@@ -246,6 +246,80 @@ def selected_attention_dense(
     return out
 
 
+def compact_selected_rows(
+    kv: torch.Tensor, indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather valid ``indices`` into a dense prefix, preserving column order.
+
+    ``kv`` is ``[rows, dim]`` or ``[rows, 1, dim]``. ``indices`` is ``[T, W]``.
+    Negative entries are dropped. The result width is the longest valid
+    selection, so an unselected workspace row is never copied.
+    """
+    if kv.ndim == 3:
+        kv = kv.squeeze(1)
+    if kv.ndim != 2:
+        raise ValueError(f"kv must be [rows, dim], got {tuple(kv.shape)}")
+    if indices.ndim != 2:
+        raise ValueError(f"indices must be [tokens, width], got {tuple(indices.shape)}")
+    valid = indices >= 0
+    lengths = valid.sum(dim=-1).to(torch.int32)
+    width = int(lengths.max()) if lengths.numel() else 0
+    rows = kv.new_zeros((indices.shape[0], width, kv.shape[-1]))
+    if width == 0:
+        return rows, lengths
+    place = valid.to(torch.int64).cumsum(dim=-1) - 1
+    gathered = kv[indices.clamp_min(0).to(torch.int64)]
+    token = torch.arange(indices.shape[0], device=kv.device)[:, None].expand_as(indices)
+    rows[token[valid], place[valid]] = gathered[valid]
+    return rows, lengths
+
+
+def prefill_workspace_selections(
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    swa_width: int,
+    cmp_ratio: int,
+    seq_lens: torch.Tensor,
+) -> tuple[PaBbndSelection, PaBbndSelection | None, torch.Tensor | None]:
+    """Split a prefill key workspace into the decode sparse-MLA blocks.
+
+    ``indices[:, :swa_width]`` address the SWA prefix of ``kv``. Later columns
+    address the compressed rows packed after it. Each query's valid keys are
+    compacted in that column order, which is the set the dense softmax reads.
+    An empty compressed selection returns no cmp block.
+    """
+    if indices.ndim != 2:
+        raise ValueError(f"indices must be [tokens, width], got {tuple(indices.shape)}")
+    if swa_width < 0 or swa_width > indices.shape[-1]:
+        raise ValueError(
+            f"swa_width must be in [0, {indices.shape[-1]}], got {swa_width}"
+        )
+    if seq_lens.shape != (indices.shape[0],):
+        raise ValueError(
+            f"seq_lens must be [T]={indices.shape[0]}, got {tuple(seq_lens.shape)}"
+        )
+    ori_rows, ori_lens = compact_selected_rows(kv, indices[:, :swa_width])
+    if ori_rows.shape[1] == 0:
+        dim = kv.shape[-1]
+        ori_rows = kv.new_zeros((indices.shape[0], 1, dim))
+    ori = materialize_bf16_rows_as_pa_bbnd(ori_rows, ori_lens)
+    cmp_indices = indices[:, swa_width:]
+    if cmp_indices.shape[-1] == 0:
+        return ori, None, None
+    cmp_rows, cmp_lens = compact_selected_rows(kv, cmp_indices)
+    if cmp_rows.shape[1] == 0:
+        return ori, None, None
+    if cmp_ratio not in (1, 2):
+        raise ValueError(
+            f"compressed prefill rows require cmp_ratio 1 or 2, got {cmp_ratio}"
+        )
+    return (
+        ori,
+        materialize_bf16_rows_as_pa_bbnd(cmp_rows, cmp_lens),
+        cmp_residual_kv(seq_lens, cmp_ratio),
+    )
+
+
 def materialize_bf16_rows_as_pa_bbnd(
     rows: torch.Tensor, lengths: torch.Tensor
 ) -> PaBbndSelection:

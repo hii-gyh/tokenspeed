@@ -44,6 +44,7 @@ from tokenspeed_kernel.ops.attention.dsv41.pages import (
     align_pa_block_for_a2,
     decode_cu_seqlens_q,
     pad_sparse_indices,
+    prefill_workspace_selections,
     repeat_query_heads,
     selected_attention_dense,
 )
@@ -184,6 +185,40 @@ if current_platform().is_npu:
             attn_sink=attn_sink,
             softmax_scale=softmax_scale,
             cmp_ratio=cmp_ratio if cmp is not None else 0,
+            ori_win_left=ori_win_left,
+            ori_win_right=ori_win_right,
+        )
+
+    def ascend_prefill_attention_from_workspace(
+        q: torch.Tensor,
+        workspace: torch.Tensor,
+        indices: torch.Tensor,
+        *,
+        swa_width: int,
+        attn_sink: torch.Tensor,
+        softmax_scale: float,
+        cmp_ratio: int,
+        seq_lens: torch.Tensor,
+        ori_win_left: int,
+        ori_win_right: int = 0,
+    ) -> torch.Tensor:
+        """Run the decode sparse-MLA launch on a prefill key workspace.
+
+        The workspace holds one request's SWA rows, then its compressed rows.
+        ``indices`` selects both. They become the same ori/cmp PA_BBND blocks
+        decode builds from FlatKV gathers, and the same launch scores them.
+        """
+        ori, cmp, residual = prefill_workspace_selections(
+            workspace, indices, swa_width, cmp_ratio, seq_lens
+        )
+        return _launch_pa_bbnd_decode(
+            q,
+            ori=ori,
+            cmp=cmp,
+            residual=residual,
+            attn_sink=attn_sink,
+            softmax_scale=softmax_scale,
+            cmp_ratio=0 if cmp is None else cmp_ratio,
             ori_win_left=ori_win_left,
             ori_win_right=ori_win_right,
         )

@@ -252,6 +252,17 @@ def test_int8_group32_dequant_matches_symmetric_reference():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_host_int8_row_ids_resolve_on_cpu():
+    from tokenspeed.runtime.models.deepseek_v41_engram import _host_int8_row_ids
+
+    indices = torch.tensor([[0, 3, -1, 8, 7]], dtype=torch.int64)
+    ids, valid = _host_int8_row_ids(indices, 0, 8)
+    assert ids.device.type == "cpu" and ids.dtype == torch.long
+    assert valid.device.type == "cpu"
+    assert ids.tolist() == [[0, 3, 0, 0, 7]]
+    assert valid.tolist() == [[True, True, False, False, True]]
+
+
 def test_int8_host_table_gathers_on_table_device():
     rows, width = 8, 64
     torch.manual_seed(0)

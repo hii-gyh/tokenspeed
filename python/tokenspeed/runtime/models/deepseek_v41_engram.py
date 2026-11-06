@@ -481,6 +481,24 @@ def _dequant_engram_rows(
     return _dequant_fp8_e8m0(codes, scales)
 
 
+def _host_int8_row_ids(
+    indices: torch.Tensor, row_start: int, row_end: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """CPU row ids into a host INT8 Engram table, and which ids were in range.
+
+    Hash ids are int64. Subtracting and masking them on the NPU has no
+    kernel; the copy that synchronizes afterward reports ACL 507034. Move
+    the ids first and resolve the range on the CPU. Out-of-range positions
+    are 0 in the id tensor and False in the mask.
+    """
+    cpu_ids = indices.detach()
+    if cpu_ids.device.type != "cpu":
+        cpu_ids = cpu_ids.contiguous().to(device="cpu")
+    valid = (cpu_ids >= row_start) & (cpu_ids < row_end)
+    shifted = (cpu_ids - row_start).masked_fill(~valid, 0).to(dtype=torch.long)
+    return shifted, valid
+
+
 class RowShardedEngramEmbedding(nn.Module):
     """Engram table codes + group-32 scales, GPU-sharded or host-resident.
 
@@ -746,6 +764,20 @@ class RowShardedEngramEmbedding(nn.Module):
                 self.row_start,
                 self.row_end,
             )
+        elif self.host_table and self.weight_dtype == torch.int8:
+            # The INT8 table stays on CPU. Resolve ids on the CPU as well:
+            # the NPU cannot run the int64 range check.
+            table_ids, valid = _host_int8_row_ids(
+                indices, self.row_start, self.row_end
+            )
+            codes = self.weight[table_ids]
+            scales = self.scale[table_ids]
+            if codes.device != indices.device:
+                codes = codes.to(device=indices.device)
+                scales = scales.to(device=indices.device)
+                valid = valid.to(device=indices.device)
+            values = _dequant_engram_rows(codes, scales, self.weight_dtype)
+            values = values.masked_fill(~valid.unsqueeze(-1), 0)
         else:
             local = (indices >= self.row_start) & (indices < self.row_end)
             local_ids = (indices - self.row_start).masked_fill(~local, 0)
@@ -754,16 +786,6 @@ class RowShardedEngramEmbedding(nn.Module):
                     self.weight.view(torch.uint8), local_ids, None
                 )
                 scales = host_gather.uint8_row_gather(self.scale, local_ids, None)
-                values = _dequant_engram_rows(codes, scales, self.weight_dtype)
-            elif self.host_table and self.weight_dtype == torch.int8:
-                # The INT8 table stays on CPU. Index it there: an NPU id cannot
-                # gather a CPU row. Dequantize on the activation device.
-                table_ids = local_ids.to(device=self.weight.device, dtype=torch.long)
-                codes = self.weight[table_ids]
-                scales = self.scale[table_ids]
-                if codes.device != indices.device:
-                    codes = codes.to(device=indices.device)
-                    scales = scales.to(device=indices.device)
                 values = _dequant_engram_rows(codes, scales, self.weight_dtype)
             else:
                 local_ids = local_ids.long()
