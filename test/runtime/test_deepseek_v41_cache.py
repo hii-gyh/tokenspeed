@@ -1068,6 +1068,16 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
     assert all(spec.transfer_policy is None for spec in specs.values())
 
 
+def test_npu_workspace_reserves_the_eager_attention_matmul():
+    cpu = _recipe("cpu")
+    npu = _recipe("npu")
+    spec = npu.attn_config.component(DeepseekV41Config)
+    npu.attn_config = replace(
+        npu.attn_config, components=(replace(spec, cache_format="v41"),)
+    )
+    assert npu.workspace_bytes() - cpu.workspace_bytes() == 5 * (1 << 30)
+
+
 def test_pool_reports_the_whole_arena_as_kv_bytes():
     # The startup memory summary reads this; without it the arena is
     # misattributed to activations and the KV row prints 0.

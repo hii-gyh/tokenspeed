@@ -31,7 +31,8 @@ Integration contract:
   never put request tensors in ForwardContext.
 * Hidden states, hashes and masks must be replicated within mapping.attn.tp_group.
   GPU-resident tables are row-sharded across attention TP and all-reduced.
-  Host tables stay in anonymous or shared host memory and gather through UVA.
+  Host tables stay in anonymous or shared host memory. FP8 gathers through UVA.
+  INT8 gathers on the CPU table, then dequantizes on the activation device.
   ``shared`` keeps one full copy per node and skips the lookup all-reduce.
   ``sharded`` keeps a host shard per attention-TP rank and retains the all-reduce.
   ``auto`` selects sharded when attention TP > 1. Output matches the GPU path.
@@ -74,6 +75,7 @@ from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_ops import all_reduce, prepare_all_reduce_lane
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
+from tokenspeed.runtime.layers.quantization.ascend import AscendQuantConfig
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.fp8 import Mxfp8Config
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
@@ -83,11 +85,21 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 logger = get_colorful_logger(__name__)
 
 _ENGRAM_EMBED_SUFFIXES = (".engram.embed.weight", ".engram.embed.scale")
+_ENGRAM_SCALE_GROUP = 32
 
 
 def is_engram_embed_checkpoint_name(name: str) -> bool:
-    """True for the two huge FP8 table tensors that must not be load_file'd."""
+    """True for the two huge table tensors that must not be load_file'd."""
     return name.endswith(_ENGRAM_EMBED_SUFFIXES)
+
+
+def _engram_table_dtypes(
+    quant_config: QuantizationConfig | None,
+) -> tuple[torch.dtype, torch.dtype]:
+    """Weight/scale storage for the Engram embedding table."""
+    if isinstance(quant_config, AscendQuantConfig):
+        return torch.int8, torch.float32
+    return torch.float8_e4m3fn, torch.uint8
 
 
 def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
@@ -448,14 +460,33 @@ def _dequant_fp8_e8m0(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
     values = codes.view(torch.uint8).view(torch.float8_e4m3fn).float()
     scale = scales.view(torch.uint8).view(torch.float8_e8m0fnu).float()
     return (
-        (values.unflatten(-1, (-1, 32)) * scale.unsqueeze(-1))
+        (values.unflatten(-1, (-1, _ENGRAM_SCALE_GROUP)) * scale.unsqueeze(-1))
         .flatten(-2)
         .to(torch.bfloat16)
     )
 
 
+def _dequant_int8_group32(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Symmetric INT8 group-32 with FP32 scales (Ascend / modelslim Engram)."""
+    decoded = codes.to(torch.float32).unflatten(-1, (-1, _ENGRAM_SCALE_GROUP))
+    decoded = decoded * scales.to(torch.float32).unsqueeze(-1)
+    return decoded.flatten(-2).to(torch.bfloat16)
+
+
+def _dequant_engram_rows(
+    codes: torch.Tensor, scales: torch.Tensor, weight_dtype: torch.dtype
+) -> torch.Tensor:
+    if weight_dtype == torch.int8:
+        return _dequant_int8_group32(codes, scales)
+    return _dequant_fp8_e8m0(codes, scales)
+
+
 class RowShardedEngramEmbedding(nn.Module):
-    """FP8 codes and raw E8M0 scale bytes, GPU-sharded or host-resident."""
+    """Engram table codes + group-32 scales, GPU-sharded or host-resident.
+
+    FP8/E8M0 is the native V4.1 checkpoint path. Ascend modelslim W8A8 uses
+    INT8 codes with FP32 group-32 scales instead.
+    """
 
     def __init__(
         self,
@@ -466,15 +497,25 @@ class RowShardedEngramEmbedding(nn.Module):
         host_table: bool,
         host_layout: str,
         layer_id: int,
+        *,
+        weight_dtype: torch.dtype = torch.float8_e4m3fn,
+        scale_dtype: torch.dtype = torch.uint8,
     ):
         super().__init__()
         if (
             num_embeddings < mapping.attn.tp_size
-            or embedding_dim < 32
-            or embedding_dim % 32
+            or embedding_dim < _ENGRAM_SCALE_GROUP
+            or embedding_dim % _ENGRAM_SCALE_GROUP
         ):
             raise ValueError(
                 "Engram embedding requires rows per TP rank and 32-wide scale blocks"
+            )
+        if (weight_dtype, scale_dtype) not in (
+            (torch.float8_e4m3fn, torch.uint8),
+            (torch.int8, torch.float32),
+        ):
+            raise ValueError(
+                "Engram tables require FP8/E8M0 or INT8/FP32 group-32 storage"
             )
         if host_table:
             if host_layout not in ("shared", "sharded"):
@@ -485,6 +526,8 @@ class RowShardedEngramEmbedding(nn.Module):
             raise ValueError("GPU Engram tables require host_layout='gpu'")
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
+        self.weight_dtype = weight_dtype
+        self.scale_dtype = scale_dtype
         self.tp_group = mapping.attn.tp_group
         self.host_table = host_table
         self.host_layout = host_layout
@@ -514,10 +557,13 @@ class RowShardedEngramEmbedding(nn.Module):
             weight_path = ""
             scale_path = ""
             weight_shape = (self.part_num_embeddings, embedding_dim)
-            scale_shape = (self.part_num_embeddings, embedding_dim // 32)
+            scale_shape = (
+                self.part_num_embeddings,
+                embedding_dim // _ENGRAM_SCALE_GROUP,
+            )
             if shared_file:
-                weight_bytes = _host_table_nbytes(weight_shape, torch.float8_e4m3fn)
-                scale_bytes = _host_table_nbytes(scale_shape, torch.uint8)
+                weight_bytes = _host_table_nbytes(weight_shape, weight_dtype)
+                scale_bytes = _host_table_nbytes(scale_shape, scale_dtype)
                 weight_path = _engram_host_table_path(layer_id, "weight", weight_bytes)
                 scale_path = _engram_host_table_path(layer_id, "scale", scale_bytes)
                 if self._shared_writer:
@@ -526,14 +572,14 @@ class RowShardedEngramEmbedding(nn.Module):
                 torch.distributed.barrier()
             weight, weight_mmap = _allocate_host_bytes(
                 weight_shape,
-                torch.float8_e4m3fn,
+                weight_dtype,
                 device,
                 shared_file,
                 weight_path,
             )
             scale, scale_mmap = _allocate_host_bytes(
                 scale_shape,
-                torch.uint8,
+                scale_dtype,
                 device,
                 shared_file,
                 scale_path,
@@ -553,7 +599,7 @@ class RowShardedEngramEmbedding(nn.Module):
                 torch.empty(
                     self.part_num_embeddings,
                     embedding_dim,
-                    dtype=torch.float8_e4m3fn,
+                    dtype=weight_dtype,
                     device=device,
                 ),
                 requires_grad=False,
@@ -561,8 +607,8 @@ class RowShardedEngramEmbedding(nn.Module):
             self.scale = nn.Parameter(
                 torch.empty(
                     self.part_num_embeddings,
-                    embedding_dim // 32,
-                    dtype=torch.uint8,
+                    embedding_dim // _ENGRAM_SCALE_GROUP,
+                    dtype=scale_dtype,
                     device=device,
                 ),
                 requires_grad=False,
@@ -576,7 +622,9 @@ class RowShardedEngramEmbedding(nn.Module):
         local_rows = self.row_end - self.row_start
         if torch.device(device).type != "meta":
             self.weight.data[local_rows:].zero_()
-            self.scale.data[local_rows:].fill_(127)
+            # FP8 unused rows keep exponent 127 (scale 1.0); INT8 uses 1.0 FP32.
+            pad = 1.0 if scale_dtype == torch.float32 else 127
+            self.scale.data[local_rows:].fill_(pad)
             self._register_host_for_gpu()
 
     def _register_host_for_gpu(self) -> None:
@@ -606,11 +654,18 @@ class RowShardedEngramEmbedding(nn.Module):
         self, param: nn.Parameter, rows: torch.Tensor, local_start: int
     ) -> None:
         if param is self.scale:
-            if rows.dtype not in (torch.uint8, torch.float8_e8m0fnu):
-                raise TypeError(
-                    "Engram scales must be E8M0 or raw uint8 exponent bytes"
-                )
-            rows = rows.view(torch.uint8)
+            if self.scale_dtype == torch.float32:
+                if rows.dtype != torch.float32:
+                    raise TypeError("Engram INT8 tables require FP32 group-32 scales")
+            else:
+                if rows.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+                    raise TypeError(
+                        "Engram scales must be E8M0 or raw uint8 exponent bytes"
+                    )
+                rows = rows.view(torch.uint8)
+        elif self.weight_dtype == torch.int8:
+            if rows.dtype != torch.int8:
+                raise TypeError("Engram INT8 table weights must stay INT8")
         elif rows.dtype != torch.float8_e4m3fn:
             raise TypeError("Engram table weights must stay FP8 E4M3")
         param.data[local_start : local_start + rows.shape[0]].copy_(rows)
@@ -673,7 +728,11 @@ class RowShardedEngramEmbedding(nn.Module):
         only local rows and reduce. Dequantization uses the same FP8/E8M0
         torch casts in both paths.
         """
-        if indices.is_cuda and not self.host_table:
+        if (
+            indices.is_cuda
+            and not self.host_table
+            and self.weight_dtype == torch.float8_e4m3fn
+        ):
             from tokenspeed_kernel.ops.embedding import mxfp8_embedding
 
             # Each layer's 2D hash slice can be gathered directly; retain the
@@ -690,18 +749,37 @@ class RowShardedEngramEmbedding(nn.Module):
         else:
             local = (indices >= self.row_start) & (indices < self.row_end)
             local_ids = (indices - self.row_start).masked_fill(~local, 0)
-            if self.host_table:
+            if self.host_table and self.weight_dtype != torch.int8:
                 codes = host_gather.uint8_row_gather(
                     self.weight.view(torch.uint8), local_ids, None
                 )
                 scales = host_gather.uint8_row_gather(self.scale, local_ids, None)
-                values = _dequant_fp8_e8m0(codes, scales)
+                values = _dequant_engram_rows(codes, scales, self.weight_dtype)
+            elif self.host_table and self.weight_dtype == torch.int8:
+                # The INT8 table stays on CPU. Index it there: an NPU id cannot
+                # gather a CPU row. Dequantize on the activation device.
+                table_ids = local_ids.to(device=self.weight.device, dtype=torch.long)
+                codes = self.weight[table_ids]
+                scales = self.scale[table_ids]
+                if codes.device != indices.device:
+                    codes = codes.to(device=indices.device)
+                    scales = scales.to(device=indices.device)
+                values = _dequant_engram_rows(codes, scales, self.weight_dtype)
             else:
                 local_ids = local_ids.long()
-                # Byte gathers work on CPU and CUDA, including dtypes without index kernels.
-                values = _dequant_fp8_e8m0(
-                    self.weight.view(torch.uint8)[local_ids], self.scale[local_ids]
-                )
+                if self.weight_dtype == torch.int8:
+                    values = _dequant_engram_rows(
+                        self.weight[local_ids],
+                        self.scale[local_ids],
+                        self.weight_dtype,
+                    )
+                else:
+                    # Byte gathers work on CPU and CUDA, including dtypes without index kernels.
+                    values = _dequant_engram_rows(
+                        self.weight.view(torch.uint8)[local_ids],
+                        self.scale[local_ids],
+                        self.weight_dtype,
+                    )
             values = values.masked_fill(~local.unsqueeze(-1), 0)
         if len(self.tp_group) > 1 and self.host_layout != "shared":
             # The workspace all-reduce sizes itself on rows x trailing width.
@@ -764,15 +842,18 @@ class DeepseekV41Engram(nn.Module):
         self.prefix = prefix
         self.n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         if quant_config is not None:
-            if (
-                not isinstance(quant_config, Mxfp8Config)
-                or not quant_config.is_checkpoint_fp8_serialized
-                or quant_config.weight_block_size != [1, 32]
-                or quant_config.scale_fmt != "ue8m0"
-            ):
+            ascend = isinstance(quant_config, AscendQuantConfig)
+            mxfp8 = (
+                isinstance(quant_config, Mxfp8Config)
+                and quant_config.is_checkpoint_fp8_serialized
+                and quant_config.weight_block_size == [1, 32]
+                and quant_config.scale_fmt == "ue8m0"
+            )
+            if not ascend and not mxfp8:
                 raise ValueError(
-                    "Engram wkv requires the V4.1 runtime 1x32 MXFP8 config"
+                    "Engram wkv requires Ascend W8A8 or the V4.1 runtime 1x32 MXFP8 config"
                 )
+        weight_dtype, scale_dtype = _engram_table_dtypes(quant_config)
         with torch.device(device):
             self.wkv = ReplicatedLinear(
                 input_size=self.n_hash_cols * layout.head_dim,
@@ -791,8 +872,10 @@ class DeepseekV41Engram(nn.Module):
                 torch.ones(self.hc_mult, self.dim, dtype=torch.bfloat16),
                 requires_grad=False,
             )
-        if quant_config is not None and not isinstance(
-            self.wkv.quant_method, Fp8LinearMethod
+        if (
+            quant_config is not None
+            and not isinstance(quant_config, AscendQuantConfig)
+            and not isinstance(self.wkv.quant_method, Fp8LinearMethod)
         ):
             raise ValueError(
                 "Do not exclude Engram wkv from checkpoint FP8 quantization"
@@ -805,6 +888,8 @@ class DeepseekV41Engram(nn.Module):
             host_table,
             host_layout,
             layer_id,
+            weight_dtype=weight_dtype,
+            scale_dtype=scale_dtype,
         )
         self.q_weight.weight_loader = default_weight_loader
         self.k_weight.weight_loader = default_weight_loader

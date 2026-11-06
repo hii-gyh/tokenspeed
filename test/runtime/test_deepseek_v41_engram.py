@@ -55,6 +55,7 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     EngramHashState,
     EngramLayout,
     RowShardedEngramEmbedding,
+    _dequant_int8_group32,
     build_compressed_token_map,
     compute_hash_multipliers,
 )
@@ -238,6 +239,49 @@ def test_token_compression_and_layout():
     config.engram_compressed_vocab_size = 10
     with pytest.raises(ValueError, match="compressed vocabulary"):
         EngramHashState(config, _Tokenizer(), "cpu")
+
+
+def test_int8_group32_dequant_matches_symmetric_reference():
+    torch.manual_seed(0)
+    codes = torch.randint(-127, 128, (3, 64), dtype=torch.int8)
+    scales = torch.randn(3, 2, dtype=torch.float32).abs() + 1e-3
+    actual = _dequant_int8_group32(codes, scales)
+    expected = (
+        codes.float().unflatten(-1, (-1, 32)) * scales.unsqueeze(-1)
+    ).flatten(-2).bfloat16()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_int8_host_table_gathers_on_table_device():
+    rows, width = 8, 64
+    torch.manual_seed(0)
+    codes = torch.randint(-127, 128, (rows, width), dtype=torch.int8)
+    scales = torch.rand(rows, width // 32) + 0.1
+    embed = RowShardedEngramEmbedding(
+        rows,
+        width,
+        _mapping(0, 1, 1),
+        "cpu",
+        True,
+        "shared",
+        1,
+        weight_dtype=torch.int8,
+        scale_dtype=torch.float32,
+    )
+    embed.weight_loader(embed.weight, codes)
+    embed.weight_loader(embed.scale, scales)
+    indices = torch.tensor([[0, 3, -1, 8, 7]])
+    actual = embed(indices)
+    expected = _dequant_int8_group32(codes, scales)[indices.clamp(0, rows - 1)].clone()
+    expected[(indices < 0) | (indices >= rows)] = 0
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.device.type == "cpu"
+    if not torch.cuda.is_available():
+        return
+    gpu_ids = indices.cuda()
+    gpu_out = embed(gpu_ids)
+    assert gpu_out.device.type == "cuda"
+    torch.testing.assert_close(gpu_out.cpu(), expected, rtol=0, atol=0)
 
 
 def test_history_chunk_prefix_reorder_and_speculative_rollback():

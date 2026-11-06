@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.attention.dsv41.indexer_torch import index_topk_torch
 from tokenspeed_kernel.ops.attention.dsv41.pages import (
     PaBbndSelection,
     adapt_flatkv_decode_selections,
+    align_pa_block_for_a2,
     decode_cu_seqlens_q,
     pad_sparse_indices,
 )
@@ -196,23 +197,30 @@ if current_platform().is_npu:
     ) -> torch.Tensor:
         tokens = q.shape[0]
         heads = q.shape[1]
+        if heads < 1 or q.shape[-1] != 512:
+            raise ValueError(
+                f"sparse MLA query must be [tokens, heads, 512], got {tuple(q.shape)}"
+            )
+        ori = align_pa_block_for_a2(ori)
+        if cmp is not None:
+            cmp = align_pa_block_for_a2(cmp)
         cu_seqlens_q = decode_cu_seqlens_q(tokens, device=q.device)
         seqused_ori = swa_lens_as_seqused(ori.topk_length)
         seqused_cmp = (
             swa_lens_as_seqused(cmp.topk_length) if cmp is not None else None
         )
-        # A2/A3 SparseFlashMla binaries only compile SWA and CSA templates
-        # (see sparse_flash_mla_template_tiling_key.h). ori_mask_mode 0 +
-        # non-zero ori_topk selects ORI_SPARSE, which has no A2 tiling key
-        # (missing tilingKey 131138). Compact FlatKV rows are already the
-        # selected window, so drive the SWA template: causal window over the
-        # compact block (mode 4, ori_topk 0). CSA adds cmp_kv with mode-3 topk.
+        # A2/A3 SparseFlashMla binaries only compile SWA and CSA templates.
+        # ori_mask_mode 0 with a non-zero ori_topk selects ORI_SPARSE, which
+        # has no A2 tiling key. Compact rows are already the selected window,
+        # so the causal band (mode 4, ori_topk 0) matches vLLM's SWA path.
+        # The same image passes the model compress ratio (0, 1, or 2) into
+        # both metadata and the attention op; A2 block size must be a multiple
+        # of 16 in [16, 1024]. The window stays the caller's sliding window.
         has_cmp = cmp is not None
         ori_mask_mode = 4
         cmp_mask_mode = 3 if has_cmp else 0
         block_rows = int(ori.kv.shape[1])
-        # Cover the whole compact block from the causal end.
-        win_left = max(int(ori_win_left), block_rows - 1)
+        win_left = max(int(ori_win_left), 0)
         win_right = max(int(ori_win_right), 0)
         _ASCEND_TOPK = 512
         cmp_sparse = None
@@ -230,9 +238,9 @@ if current_platform().is_npu:
                 cmp_sparse = pad_sparse_indices(
                     cmp.sparse_indices.squeeze(1), cmp_topk
                 )
-            # A2 CSA kernel attr is 4 (see below), so the op requires
-            # cmp_residual_kv whenever cmp_mask_mode=3. Model ratio-1 layers
-            # produce no residual from pages; pass zeros (full cmp coverage).
+            # cmp_mask_mode 3 with cmp_ratio other than 1 requires a residual
+            # vector. Ratio-1 layers have none; zeros mean the compressed
+            # block already covers the sequence.
             if residual is None:
                 residual = torch.zeros(
                     tokens, dtype=torch.int32, device=q.device
@@ -262,13 +270,11 @@ if current_platform().is_npu:
             has_ori_kv=True,
             has_cmp_kv=has_cmp,
         )
-        # A2/A3 OPP: SWA (no cmp_kv) wants kernel cmp_ratio=1; CSA with
-        # cmp_sparse_indices specializes tiling on kernel cmp_ratio=4 even
-        # when the model compress_ratio in metadata/residual is 1 or 2
-        # (CheckSingleParaCmpRatio: "should be 4 in CSA ...").
-        # Call the OPP wrapper directly (not the registry entry) so optional
-        # cmp_kv / sparse tensors are not dropped by kernel-dispatch wrapping.
-        kernel_cmp_ratio = 1 if not has_cmp else 4
+        # Same ratio the metadata kernel just consumed. vLLM on this image
+        # passes 0 without cmp_kv and the model ratio (1 or 2) with it.
+        # Call the OPP wrapper directly so optional cmp tensors are not
+        # dropped by kernel-dispatch wrapping.
+        kernel_cmp_ratio = 0 if not has_cmp else int(cmp_ratio)
         out, _ = npu_sparse_flash_mla(
             q,
             ori_kv=ori.kv.contiguous(),

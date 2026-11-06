@@ -56,6 +56,43 @@ def create_flashinfer_kv_indices_triton(
 # --- Page-based memory profiling ---
 
 
+def prime_device_collectives_for_cache_profile(mapping) -> None:
+    """Allocate HCCL/NCCL buffers before the cache profile reads driver free memory.
+
+    The first collective on a group creates its buffer. Attention TP and MoE
+    EP do that during eager warmup, after the pool has already been sized, so
+    the profile would hand those bytes to the KV pool. One empty all-reduce
+    on each group that already exists makes ``mem_get_info`` see them.
+    """
+    import torch
+    import torch.distributed as dist
+
+    if mapping is None or not dist.is_initialized():
+        return
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        device = torch.device("npu", torch.npu.current_device())
+    elif torch.cuda.is_available():
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        return
+    candidates = (
+        mapping.attn.tp_group,
+        mapping.moe.tp_ep_group,
+        mapping.moe.ep_group,
+    )
+    seen: set[tuple[int, ...]] = set()
+    for group in candidates:
+        if group is None or len(group) <= 1 or group in seen:
+            continue
+        if not pg_manager.has_process_group(pg_manager._device_backend, group):
+            continue
+        seen.add(group)
+        token = torch.zeros(1, device=device)
+        dist.all_reduce(token, group=pg_manager.get_device_process_group(group))
+    if device.type == "npu":
+        torch.npu.synchronize(device)
+
+
 def profile_available_cache_memory_bytes(
     attn_config: AttnConfig,
     gpu_id: int,

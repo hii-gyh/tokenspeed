@@ -79,6 +79,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 )
 from tokenspeed.runtime.layers.attention.utils import (
     check_probe_cache_fits,
+    prime_device_collectives_for_cache_profile,
     profile_available_cache_memory_bytes,
     reserve_cache_budget,
 )
@@ -1297,6 +1298,7 @@ def create_attn_components(
     )
     # One profile per boot, where a boot without a reserve takes it; a rebuild reuses it.
     if profiled_cache_bytes is None:
+        prime_device_collectives_for_cache_profile(server_args.mapping)
         profiled_cache_bytes = profile_available_cache_memory_bytes(
             attn_config=config,
             gpu_id=gpu_id,

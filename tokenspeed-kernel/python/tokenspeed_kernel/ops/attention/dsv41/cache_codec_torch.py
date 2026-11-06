@@ -166,37 +166,79 @@ def _unpack_rows(packed: torch.Tensor, cache_format: str, dtype: torch.dtype) ->
     return (decoded * scale.unsqueeze(-1)).reshape(*packed.shape[:-1], dim).to(dtype)
 
 
+def _selected_byte_offsets(
+    slots: torch.Tensor, cols: torch.Tensor, page_stride: int
+) -> torch.Tensor:
+    """Byte offsets of selected in-page columns. One int64 per copied byte.
+
+    ``page * page_stride`` passes 2^31 once the pool is larger than 2 GiB, so
+    the multiply stays in int64. The result has one entry per selected byte,
+    never one per page of the pool.
+    """
+    page = torch.div(slots, _PAGE_ROWS, rounding_mode="floor").to(torch.int64)
+    return page.unsqueeze(1) * int(page_stride) + cols.to(torch.int64)
+
+
+def _page_storage(flat: torch.Tensor) -> torch.Tensor:
+    """One byte-addressable span covering every page, including inter-page pad."""
+    page_stride = flat.stride(0)
+    if page_stride < flat.shape[1]:
+        raise ValueError("planar page stride is shorter than the page width")
+    span = (flat.shape[0] - 1) * page_stride + flat.shape[1]
+    return flat.as_strided((span,), (1,))
+
+
+def _column_indexes(slots: torch.Tensor, width: int, origin: int) -> torch.Tensor:
+    page_row = (slots % _PAGE_ROWS).to(torch.int64).unsqueeze(1)
+    return origin + page_row * width + torch.arange(
+        width, device=slots.device, dtype=torch.int64
+    )
+
+
+def _transfer_selected(
+    storage: torch.Tensor, offsets: torch.Tensor, packed_cols: torch.Tensor, *, write: bool
+) -> None:
+    if write:
+        storage[offsets] = packed_cols
+        return
+    packed_cols.copy_(storage[offsets])
+
+
 def _write_planar(cache: torch.Tensor, slots: torch.Tensor, packed: torch.Tensor, cache_format: str) -> None:
     _, _, value_bytes, row_bytes = _layout(cache_format)
     scale_bytes = row_bytes - value_bytes
     flat = _flat_pages(cache, row_bytes)
-    page = torch.div(slots, _PAGE_ROWS, rounding_mode="floor")[:, None]
-    page_row = (slots % _PAGE_ROWS)[:, None]
-    value_cols = page_row * value_bytes + torch.arange(value_bytes, device=cache.device)
-    scale_cols = (
-        _PAGE_ROWS * value_bytes
-        + page_row * scale_bytes
-        + torch.arange(scale_bytes, device=cache.device)
+    storage = _page_storage(flat)
+    page_stride = flat.stride(0)
+    value_offsets = _selected_byte_offsets(
+        slots, _column_indexes(slots, value_bytes, 0), page_stride
     )
-    flat[page.expand_as(value_cols), value_cols] = packed[:, :value_bytes]
-    flat[page.expand_as(scale_cols), scale_cols] = packed[:, value_bytes:]
+    scale_offsets = _selected_byte_offsets(
+        slots,
+        _column_indexes(slots, scale_bytes, _PAGE_ROWS * value_bytes),
+        page_stride,
+    )
+    _transfer_selected(storage, value_offsets, packed[:, :value_bytes], write=True)
+    _transfer_selected(storage, scale_offsets, packed[:, value_bytes:], write=True)
 
 
 def _read_planar(cache: torch.Tensor, slots: torch.Tensor, cache_format: str) -> torch.Tensor:
     _, _, value_bytes, row_bytes = _layout(cache_format)
     scale_bytes = row_bytes - value_bytes
     flat = _flat_pages(cache, row_bytes)
-    page = torch.div(slots, _PAGE_ROWS, rounding_mode="floor")[:, None]
-    page_row = (slots % _PAGE_ROWS)[:, None]
-    value_cols = page_row * value_bytes + torch.arange(value_bytes, device=cache.device)
-    scale_cols = (
-        _PAGE_ROWS * value_bytes
-        + page_row * scale_bytes
-        + torch.arange(scale_bytes, device=cache.device)
-    )
+    storage = _page_storage(flat)
+    page_stride = flat.stride(0)
     packed = cache.new_empty(slots.shape[0], row_bytes)
-    packed[:, :value_bytes] = flat[page.expand_as(value_cols), value_cols]
-    packed[:, value_bytes:] = flat[page.expand_as(scale_cols), scale_cols]
+    value_offsets = _selected_byte_offsets(
+        slots, _column_indexes(slots, value_bytes, 0), page_stride
+    )
+    scale_offsets = _selected_byte_offsets(
+        slots,
+        _column_indexes(slots, scale_bytes, _PAGE_ROWS * value_bytes),
+        page_stride,
+    )
+    _transfer_selected(storage, value_offsets, packed[:, :value_bytes], write=False)
+    _transfer_selected(storage, scale_offsets, packed[:, value_bytes:], write=False)
     return packed
 
 

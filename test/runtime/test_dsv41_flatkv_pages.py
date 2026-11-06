@@ -1,0 +1,151 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Host tests for the FlatKV → Ascend PA_BBND page adapter."""
+
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+import torch
+
+_PAGES_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "tokenspeed-kernel"
+    / "python"
+    / "tokenspeed_kernel"
+    / "ops"
+    / "attention"
+    / "dsv41"
+    / "pages.py"
+)
+_spec = importlib.util.spec_from_file_location("dsv41_pages_host", _PAGES_PATH)
+_pages = importlib.util.module_from_spec(_spec)
+assert _spec.loader is not None
+_spec.loader.exec_module(_pages)
+
+FLATKV_PAGE_ROWS = _pages.FLATKV_PAGE_ROWS
+HEAD_DIM = _pages.HEAD_DIM
+adapt_flatkv_decode_selections = _pages.adapt_flatkv_decode_selections
+as_pa_bbnd = _pages.as_pa_bbnd
+cmp_residual_kv = _pages.cmp_residual_kv
+compact_selection_indices = _pages.compact_selection_indices
+identity_block_table = _pages.identity_block_table
+lcm_block_table_as_pa = _pages.lcm_block_table_as_pa
+align_pa_block_for_a2 = _pages.align_pa_block_for_a2
+materialize_bf16_rows_as_pa_bbnd = _pages.materialize_bf16_rows_as_pa_bbnd
+pad_sparse_indices = _pages.pad_sparse_indices
+
+
+def test_as_pa_bbnd_views_page_planar_without_copy():
+    cache = torch.zeros(3, FLATKV_PAGE_ROWS, HEAD_DIM, dtype=torch.bfloat16)
+    viewed = as_pa_bbnd(cache)
+    assert viewed.shape == (3, FLATKV_PAGE_ROWS, 1, HEAD_DIM)
+    assert viewed.data_ptr() == cache.data_ptr()
+
+
+def test_lcm_block_table_as_pa_is_contiguous_int32():
+    table = torch.tensor([[1, 2], [3, 0]], dtype=torch.int64)
+    out = lcm_block_table_as_pa(table)
+    assert out.dtype == torch.int32
+    assert out.is_contiguous()
+    assert out.tolist() == [[1, 2], [3, 0]]
+
+
+def test_materialize_builds_one_block_per_query():
+    rows = torch.randn(2, 4, HEAD_DIM, dtype=torch.bfloat16)
+    lengths = torch.tensor([3, 1], dtype=torch.int32)
+    selection = materialize_bf16_rows_as_pa_bbnd(rows, lengths)
+    assert selection.kv.shape == (2, 4, 1, HEAD_DIM)
+    assert selection.block_table.tolist() == [[0], [1]]
+    assert selection.sparse_indices.shape == (2, 1, 4)
+    assert selection.sparse_indices[0, 0].tolist() == [0, 1, 2, -1]
+    assert selection.sparse_indices[1, 0].tolist() == [0, -1, -1, -1]
+    assert selection.topk_length.tolist() == [[3], [1]]
+
+
+def test_a2_block_alignment_pads_short_selections_and_keeps_visible_rows():
+    rows = torch.randn(2, 4, HEAD_DIM, dtype=torch.bfloat16)
+    lengths = torch.tensor([3, 1], dtype=torch.int32)
+    aligned = align_pa_block_for_a2(materialize_bf16_rows_as_pa_bbnd(rows, lengths))
+    assert aligned.kv.shape == (2, 16, 1, HEAD_DIM)
+    assert aligned.kv[:, :4].equal(rows.unsqueeze(2))
+    assert aligned.sparse_indices.shape == (2, 1, 16)
+    assert aligned.sparse_indices[0, 0, :4].tolist() == [0, 1, 2, -1]
+    assert aligned.sparse_indices[0, 0, 4:].eq(-1).all()
+    assert aligned.topk_length.tolist() == [[3], [1]]
+    wide = materialize_bf16_rows_as_pa_bbnd(
+        torch.randn(1, 128, HEAD_DIM, dtype=torch.bfloat16),
+        torch.tensor([128], dtype=torch.int32),
+    )
+    assert align_pa_block_for_a2(wide).kv.shape[1] == 128
+
+
+def test_adapt_flatkv_decode_selections_ratio2_residual():
+    swa = torch.randn(2, 8, HEAD_DIM, dtype=torch.bfloat16)
+    swa_lens = torch.tensor([8, 5], dtype=torch.int32)
+    global_rows = torch.randn(2, 4, HEAD_DIM, dtype=torch.bfloat16)
+    global_lens = torch.tensor([4, 2], dtype=torch.int32)
+    seq_lens = torch.tensor([9, 4], dtype=torch.int32)
+    ori, cmp, residual = adapt_flatkv_decode_selections(
+        swa_rows=swa,
+        swa_lens=swa_lens,
+        global_rows=global_rows,
+        global_lens=global_lens,
+        cmp_ratio=2,
+        seq_lens=seq_lens,
+    )
+    assert ori.kv.shape[0] == 2
+    assert cmp is not None and cmp.kv.shape[0] == 2
+    assert residual is not None
+    assert residual.tolist() == [1, 0]
+
+
+def test_adapt_swa_only_skips_compressed():
+    swa = torch.randn(1, 4, HEAD_DIM, dtype=torch.bfloat16)
+    ori, cmp, residual = adapt_flatkv_decode_selections(
+        swa_rows=swa,
+        swa_lens=torch.tensor([4], dtype=torch.int32),
+        global_rows=None,
+        global_lens=None,
+        cmp_ratio=0,
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+    )
+    assert cmp is None and residual is None
+    assert ori.block_table.tolist() == [[0]]
+
+
+def test_pad_and_compact_helpers():
+    padded = pad_sparse_indices(torch.tensor([[0, 2], [1, -1]]), topk=4)
+    assert padded.shape == (2, 1, 4)
+    assert padded[0, 0].tolist() == [0, 2, -1, -1]
+    indices, lengths = compact_selection_indices(
+        torch.tensor([2, 0], dtype=torch.int32), 3
+    )
+    assert indices[0, 0].tolist() == [0, 1, -1]
+    assert lengths.tolist() == [[2], [0]]
+    assert identity_block_table(3, device=torch.device("cpu")).tolist() == [
+        [0],
+        [1],
+        [2],
+    ]
+    assert cmp_residual_kv(torch.tensor([5, 4]), 2).tolist() == [1, 0]
+    assert cmp_residual_kv(torch.tensor([5, 4]), 1) is None
