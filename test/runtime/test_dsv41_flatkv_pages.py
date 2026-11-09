@@ -51,8 +51,15 @@ compact_selection_indices = _pages.compact_selection_indices
 identity_block_table = _pages.identity_block_table
 lcm_block_table_as_pa = _pages.lcm_block_table_as_pa
 align_pa_block_for_a2 = _pages.align_pa_block_for_a2
+a2_cmp_topk = _pages.a2_cmp_topk
 materialize_bf16_rows_as_pa_bbnd = _pages.materialize_bf16_rows_as_pa_bbnd
 pad_sparse_indices = _pages.pad_sparse_indices
+
+
+def test_cmp_topk_uses_the_metadata_buckets():
+    assert a2_cmp_topk(16) == 512
+    assert a2_cmp_topk(512) == 512
+    assert a2_cmp_topk(513) == 1024
 
 
 def test_as_pa_bbnd_views_page_planar_without_copy():

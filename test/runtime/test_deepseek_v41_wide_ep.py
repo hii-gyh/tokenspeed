@@ -62,6 +62,8 @@ restore_gathered_tokens = _dispatch.restore_gathered_tokens
 mapping_uses_wide_ep = _dispatch.mapping_uses_wide_ep
 ced_narrowing_needs_row_exchange = _dispatch.ced_narrowing_needs_row_exchange
 wide_ep_dispatch_bounds = _dispatch.wide_ep_dispatch_bounds
+ep_dispatch_includes_empty_rank = _dispatch.ep_dispatch_includes_empty_rank
+ep_dispatch_local_rows = _dispatch.ep_dispatch_local_rows
 pad_token_dim = _dispatch.pad_token_dim
 unpad_token_dim = _dispatch.unpad_token_dim
 apply_wide_ep_rowwise = _dispatch.apply_wide_ep_rowwise
@@ -279,6 +281,56 @@ def test_wide_ep_dispatch_bounds_agree_across_idle_groups():
     assert maximum == 1
     # A rank that only knows its own zero count would size a different batch.
     assert wide_ep_dispatch_bounds([0])[1] != maximum
+
+
+def test_idle_rank_joins_dispatch_with_one_dummy_row():
+    # One attention group has a row. An idle rank still enters that dispatch.
+    assert ep_dispatch_includes_empty_rank(
+        local_tokens=0,
+        num_global_tokens=_ATTN_TP,
+        max_num_tokens_per_gpu=1,
+        all_to_all=True,
+    )
+    # This CANN rejects batch 0, so the idle rank sends one dummy row.
+    # It is not padded up to the busy rank's count.
+    assert (
+        ep_dispatch_local_rows(
+            0,
+            num_global_tokens=_ATTN_TP,
+            max_num_tokens_per_gpu=1,
+            all_to_all=True,
+        )
+        == 1
+    )
+    assert (
+        ep_dispatch_local_rows(
+            1,
+            num_global_tokens=_ATTN_TP,
+            max_num_tokens_per_gpu=1,
+            all_to_all=True,
+        )
+        == 1
+    )
+    # Every rank empty: the group does not enter.
+    assert (
+        ep_dispatch_local_rows(
+            0,
+            num_global_tokens=0,
+            max_num_tokens_per_gpu=0,
+            all_to_all=True,
+        )
+        == 0
+    )
+    # A kernel that does not own the collective keeps the local early return.
+    assert (
+        ep_dispatch_local_rows(
+            0,
+            num_global_tokens=_ATTN_TP,
+            max_num_tokens_per_gpu=1,
+            all_to_all=False,
+        )
+        == 0
+    )
 
 
 def test_wide_ep_narrowing_does_not_wait_for_a_row_exchange():

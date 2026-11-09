@@ -485,6 +485,32 @@ def _ascend_int8_gmm2_finalize(hidden, hidden_scale, counts, rows, ids, weights,
     )
 
 
+def _ascend_mc2_global_bs(
+    num_tokens_global: int | None,
+    max_num_tokens_per_gpu: int | None,
+    num_groups: int,
+    chunk_groups: int,
+    ep_size: int,
+) -> int:
+    """Shared ``global_bs`` for one dispatch and its matching combine.
+
+    vLLM-Ascend's uneven path passes ``max_bs_per_rank * ep_world_size`` and
+    does not pass ``x_active_mask``. SGLang's tiling accepts that value, or 0
+    when every rank has the same local batch. ``comm_alg="fullmesh"`` allows
+    those local batches to differ, including 0. ``fullmesh_v2`` rejects a
+    differing batch, so the call stays on fullmesh.
+    """
+    chunk_global_tokens = 0
+    if num_tokens_global:
+        chunk_global_tokens = int(num_tokens_global) // num_groups * int(chunk_groups)
+    chunk_max_tokens = 0
+    if max_num_tokens_per_gpu:
+        chunk_max_tokens = int(max_num_tokens_per_gpu) // num_groups * int(chunk_groups)
+    if chunk_max_tokens:
+        return chunk_max_tokens * int(ep_size)
+    return chunk_global_tokens
+
+
 def ascend_bf16_distributed_precomputed_moe_apply(
     plan: dict,
     x: torch.Tensor,
@@ -577,19 +603,13 @@ def ascend_bf16_distributed_precomputed_moe_apply(
             )
         physical_ids = torch.where(is_real, physical_ids, special_ids).to(torch.int32)
 
-        chunk_global_tokens = 0
-        if num_tokens_global:
-            chunk_global_tokens = (
-                int(num_tokens_global) // num_groups * int(chunk.num_groups)
-            )
-        chunk_max_tokens = 0
-        if max_num_tokens_per_gpu:
-            chunk_max_tokens = (
-                int(max_num_tokens_per_gpu) // num_groups * int(chunk.num_groups)
-            )
-        global_bs = chunk_global_tokens
-        if chunk_max_tokens:
-            global_bs = chunk_max_tokens * int(w.ep_size)
+        global_bs = _ascend_mc2_global_bs(
+            num_tokens_global,
+            max_num_tokens_per_gpu,
+            num_groups,
+            int(chunk.num_groups),
+            int(w.ep_size),
+        )
 
         dispatch = torch_npu.npu_moe_distribute_dispatch_v2(
             x=chunk_x,
@@ -778,19 +798,13 @@ def ascend_int8_distributed_precomputed_moe_apply(
             )
         physical_ids = torch.where(is_real, physical_ids, special_ids).to(torch.int32)
 
-        chunk_global_tokens = 0
-        if num_tokens_global:
-            chunk_global_tokens = (
-                int(num_tokens_global) // num_groups * int(chunk.num_groups)
-            )
-        chunk_max_tokens = 0
-        if max_num_tokens_per_gpu:
-            chunk_max_tokens = (
-                int(max_num_tokens_per_gpu) // num_groups * int(chunk.num_groups)
-            )
-        global_bs = chunk_global_tokens
-        if chunk_max_tokens:
-            global_bs = chunk_max_tokens * int(w.ep_size)
+        global_bs = _ascend_mc2_global_bs(
+            num_tokens_global,
+            max_num_tokens_per_gpu,
+            num_groups,
+            int(chunk.num_groups),
+            int(w.ep_size),
+        )
 
         dispatch = torch_npu.npu_moe_distribute_dispatch_v2(
             x=chunk_x,

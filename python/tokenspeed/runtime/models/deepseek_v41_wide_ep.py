@@ -24,6 +24,12 @@ Attention TP all-reduces a replica, so every rank in that replica holds the same
 hidden rows. An expert group that spans several replicas must send each row
 once. vLLM's data-parallel plus tensor-parallel expert dispatch has the same
 volume: ``num_tokens * hidden * dtype_bytes`` each way, per layer.
+
+The dispatch itself follows vLLM-Ascend's uneven path and the SGLang tiling
+contract: every expert rank enters one ``npu_moe_distribute_dispatch_v2``, and
+``global_bs`` is the per-rank maximum times the expert-parallel size. This A2
+op rejects a batch of 0, so an idle rank sends one dummy row and drops it
+after combine. Ranks are not padded up to the maximum.
 """
 
 from __future__ import annotations
@@ -111,6 +117,59 @@ def wide_ep_dispatch_bounds(local_counts: list[int]) -> tuple[int, int]:
             f"wide EP token counts must be non-negative, got {local_counts}"
         )
     return sum(local_counts), max(local_counts)
+
+
+def ep_dispatch_includes_empty_rank(
+    *,
+    local_tokens: int,
+    num_global_tokens: int,
+    max_num_tokens_per_gpu: int,
+    all_to_all: bool,
+) -> bool:
+    """Whether a rank with no local rows still joins this dispatch.
+
+    vLLM-Ascend does this on the uneven path, where attention is data-parallel
+    and the MoE output is not all-reduced: ``global_bs`` is the per-rank
+    maximum times the expert-parallel size, and ``x_active_mask`` is omitted.
+    SGLang's tiling accepts a local batch of 0 for ``comm_alg="fullmesh"``
+    when that ``global_bs`` is shared. ``fullmesh_v2`` does not, so the call
+    stays on fullmesh. Padding the empty rank up to the maximum would route
+    tokens that were never in the batch. When every rank is empty, nobody
+    enters.
+    """
+    if local_tokens < 0 or num_global_tokens < 0 or max_num_tokens_per_gpu < 0:
+        raise ValueError(
+            "token counts must be non-negative, got "
+            f"local={local_tokens} global={num_global_tokens} "
+            f"max={max_num_tokens_per_gpu}"
+        )
+    if not all_to_all or local_tokens != 0:
+        return False
+    return num_global_tokens > 0 or max_num_tokens_per_gpu > 0
+
+
+def ep_dispatch_local_rows(
+    local_tokens: int,
+    *,
+    num_global_tokens: int,
+    max_num_tokens_per_gpu: int,
+    all_to_all: bool,
+) -> int:
+    """Rows this rank passes into ``npu_moe_distribute_dispatch_v2``.
+
+    The installed A2 op rejects a batch of 0. Its legal range is ``[1, 256]``.
+    An idle rank that still has to join the collective therefore contributes
+    one dummy row. The caller drops that row after combine. Ranks are not
+    padded up to the per-rank maximum.
+    """
+    if ep_dispatch_includes_empty_rank(
+        local_tokens=local_tokens,
+        num_global_tokens=num_global_tokens,
+        max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+        all_to_all=all_to_all,
+    ):
+        return 1
+    return local_tokens
 
 
 def mapping_uses_wide_ep(mapping) -> bool:

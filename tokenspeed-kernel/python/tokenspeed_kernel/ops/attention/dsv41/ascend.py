@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.attention.dsv41.indexer_torch import index_topk_torch
 from tokenspeed_kernel.ops.attention.dsv41.pages import (
     PaBbndSelection,
     adapt_flatkv_decode_selections,
+    a2_cmp_topk,
     align_pa_block_for_a2,
     decode_cu_seqlens_q,
     pad_sparse_indices,
@@ -62,22 +63,24 @@ if current_platform().is_npu:
     _FP32_SIG = frozenset({format_signature(x=dense_tensor_format(torch.float32))})
     _BYTE_SIG = frozenset({format_signature(x=dense_tensor_format(torch.uint8))})
     _BF16_SIG = frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))})
-    # The metadata kernel writes 1024 int32s. The installed attention op
-    # rejects that and requires dim 0 == 2048, so the tail is zero-filled.
-    _SPARSE_MLA_METADATA_LEN = 2048
+    # The metadata kernel writes 1024 int32s. A one-card launch accepts that.
+    # The 1024-token SWA warmup on the cluster asks for 2048, so the caller
+    # retries with the longer buffer when tiling says so.
+    _SPARSE_MLA_METADATA_LEN = 1024
+    _SPARSE_MLA_METADATA_RETRY = 2048
     # The A2 example launches 64 query heads. TP ranks may hold fewer; the
     # vector tiles are 16-wide, so repeat up to the example width and slice back.
     _SPARSE_MLA_QUERY_HEADS = 64
 
-    def _pad_sparse_mla_metadata(metadata: torch.Tensor) -> torch.Tensor:
-        if metadata.shape[0] == _SPARSE_MLA_METADATA_LEN:
-            return metadata
-        if metadata.ndim != 1 or metadata.shape[0] > _SPARSE_MLA_METADATA_LEN:
+    def _metadata_buffer(metadata: torch.Tensor, length: int) -> torch.Tensor:
+        if metadata.ndim != 1 or metadata.shape[0] > length:
             raise ValueError(
                 "SparseFlashMla metadata must be a vector of at most "
-                f"{_SPARSE_MLA_METADATA_LEN}, got {tuple(metadata.shape)}"
+                f"{length}, got {tuple(metadata.shape)}"
             )
-        padded = metadata.new_zeros(_SPARSE_MLA_METADATA_LEN)
+        if metadata.shape[0] == length:
+            return metadata
+        padded = metadata.new_zeros(length)
         padded[: metadata.shape[0]] = metadata
         return padded
 
@@ -134,7 +137,7 @@ if current_platform().is_npu:
             seqused_cmp_kv=seqused_cmp_kv,
             cmp_residual_kv=cmp_residual_kv,
             sinks=sinks,
-            metadata=_pad_sparse_mla_metadata(metadata),
+            metadata=_metadata_buffer(metadata, _SPARSE_MLA_METADATA_LEN),
             softmax_scale=softmax_scale,
             cmp_ratio=cmp_ratio,
             ori_mask_mode=ori_mask_mode,
@@ -244,8 +247,21 @@ if current_platform().is_npu:
         q, sinks = repeat_query_heads(q, attn_sink, _SPARSE_MLA_QUERY_HEADS)
         heads = q.shape[1]
         ori = align_pa_block_for_a2(ori)
+        index_width = 0
         if cmp is not None:
             cmp = align_pa_block_for_a2(cmp)
+            # cmp_topk is the index width, 512 or 1024. The KV block stays the
+            # compact row count. Extra index columns are -1 and are not read.
+            index_width = a2_cmp_topk(int(cmp.sparse_indices.shape[-1]))
+            if cmp.sparse_indices.shape[-1] != index_width:
+                cmp = PaBbndSelection(
+                    cmp.kv,
+                    cmp.block_table,
+                    torch.nn.functional.pad(
+                        cmp.sparse_indices, (0, index_width - cmp.sparse_indices.shape[-1]), value=-1
+                    ),
+                    cmp.topk_length,
+                )
         block_rows = int(ori.kv.shape[1])
         cu_seqlens_q = decode_cu_seqlens_q(tokens, device=q.device)
         seqused_ori = (
@@ -262,8 +278,8 @@ if current_platform().is_npu:
         # ori_mask_mode 0 with a non-zero ori_topk selects ORI_SPARSE, which
         # has no A2 tiling key. Compact rows are already the selected window,
         # so the causal band (mode 4, ori_topk 0) matches vLLM's SWA path.
-        # cmp_topk is the compact block width, never larger than max_seqlen:
-        # the metadata kernel indexes those positions into the sequence.
+        # cmp_topk is the padded index width. max_seqlen_cmp_kv stays the
+        # compact block length, matching vLLM's split of those two arguments.
         has_cmp = cmp is not None
         ori_mask_mode = 4
         cmp_mask_mode = 3 if has_cmp else 0
@@ -274,7 +290,7 @@ if current_platform().is_npu:
         max_seqlen_cmp = 0
         if has_cmp:
             max_seqlen_cmp = int(cmp.kv.shape[1])
-            cmp_topk = max_seqlen_cmp
+            cmp_topk = index_width
             cmp_sparse = cmp.sparse_indices
             # cmp_mask_mode 3 with cmp_ratio other than 1 requires a residual
             # vector. Ratio-1 layers have none; zeros mean the compressed
@@ -293,7 +309,17 @@ if current_platform().is_npu:
         )
         if ori_max <= 0 and cmp_max <= 0:
             return q.new_zeros((tokens, live_heads, q.shape[-1]))
-        metadata = npu_sparse_flash_mla_metadata(
+
+        def _guard(fn):
+            try:
+                return fn()
+            except Exception:
+                import traceback
+
+                traceback.print_exc()
+                raise
+
+        metadata = _guard(lambda: npu_sparse_flash_mla_metadata(
             heads,
             1,
             q.shape[-1],
@@ -317,34 +343,48 @@ if current_platform().is_npu:
             ori_win_right=win_right,
             has_ori_kv=True,
             has_cmp_kv=has_cmp,
-        )
+        ))
         # Same ratio the metadata kernel just consumed. vLLM on this image
         # passes 0 without cmp_kv and the model ratio (1 or 2) with it.
         # Call the OPP wrapper directly so optional cmp tensors are not
         # dropped by kernel-dispatch wrapping.
         kernel_cmp_ratio = 0 if not has_cmp else int(cmp_ratio)
-        out, _ = npu_sparse_flash_mla(
-            q,
-            ori_kv=ori.kv.contiguous(),
-            cmp_kv=None if not has_cmp else cmp.kv.contiguous(),
-            ori_sparse_indices=None,
-            ori_topk_length=None,
-            cmp_sparse_indices=cmp_sparse,
-            ori_block_table=ori.block_table,
-            cmp_block_table=None if not has_cmp else cmp.block_table,
-            cu_seqlens_q=cu_seqlens_q,
-            seqused_ori_kv=seqused_ori,
-            seqused_cmp_kv=seqused_cmp,
-            cmp_residual_kv=residual,
-            sinks=sinks,
-            metadata=_pad_sparse_mla_metadata(metadata),
-            softmax_scale=softmax_scale,
-            cmp_ratio=kernel_cmp_ratio,
-            ori_mask_mode=ori_mask_mode,
-            cmp_mask_mode=cmp_mask_mode,
-            ori_win_left=win_left,
-            ori_win_right=win_right,
-        )
+
+        def _attend(metadata_vector: torch.Tensor) -> torch.Tensor:
+            attended, _ = npu_sparse_flash_mla(
+                q,
+                ori_kv=ori.kv.contiguous(),
+                cmp_kv=None if not has_cmp else cmp.kv.contiguous(),
+                ori_sparse_indices=None,
+                ori_topk_length=None,
+                cmp_sparse_indices=cmp_sparse,
+                ori_block_table=ori.block_table,
+                cmp_block_table=None if not has_cmp else cmp.block_table,
+                cu_seqlens_q=cu_seqlens_q,
+                seqused_ori_kv=seqused_ori,
+                seqused_cmp_kv=seqused_cmp,
+                cmp_residual_kv=residual,
+                sinks=sinks,
+                metadata=metadata_vector,
+                softmax_scale=softmax_scale,
+                cmp_ratio=kernel_cmp_ratio,
+                ori_mask_mode=ori_mask_mode,
+                cmp_mask_mode=cmp_mask_mode,
+                ori_win_left=win_left,
+                ori_win_right=win_right,
+            )
+            return attended
+
+        try:
+            out = _guard(
+                lambda: _attend(_metadata_buffer(metadata, _SPARSE_MLA_METADATA_LEN))
+            )
+        except RuntimeError as exc:
+            if "must be2048" not in str(exc):
+                raise
+            out = _guard(
+                lambda: _attend(_metadata_buffer(metadata, _SPARSE_MLA_METADATA_RETRY))
+            )
         return out[:, :live_heads]
 
     def swa_lens_as_seqused(topk_length: torch.Tensor) -> torch.Tensor:

@@ -166,7 +166,43 @@ def align_pa_block_for_a2(selection: PaBbndSelection) -> PaBbndSelection:
         )
     if aligned == width:
         return selection
-    pad = aligned - width
+    return pad_pa_block(selection, aligned)
+
+
+_A2_CMP_TOPK_BUCKETS = (512, 1024)
+
+
+def a2_cmp_topk(block_rows: int) -> int:
+    """``cmp_topk`` accepted by this image when compressed KV is present.
+
+    ``aclnnSparseFlashMlaMetadata`` only allows 0, 512, or 1024 once
+    ``has_cmp_kv`` is set. 0 is the no-compressed-KV case. A present block
+    uses the smallest of 512 and 1024 that covers its row count.
+    """
+    if block_rows < 1:
+        raise ValueError(f"compressed block rows must be positive, got {block_rows}")
+    for bucket in _A2_CMP_TOPK_BUCKETS:
+        if block_rows <= bucket:
+            return bucket
+    raise ValueError(
+        f"compressed block of {block_rows} rows exceeds {_A2_CMP_TOPK_BUCKETS[-1]}"
+    )
+
+
+def pad_pa_block(selection: PaBbndSelection, width: int) -> PaBbndSelection:
+    """Pad a compact PA block on the row axis. Extra rows stay masked."""
+    if width < 1:
+        raise ValueError(f"block width must be positive, got {width}")
+    if selection.kv.ndim != 4 or selection.kv.shape[2] != 1:
+        raise ValueError(
+            f"PA_BBND kv must be [blocks, block, 1, dim], got {tuple(selection.kv.shape)}"
+        )
+    current = int(selection.kv.shape[1])
+    if current > width:
+        raise ValueError(f"block width {current} exceeds target {width}")
+    if current == width:
+        return selection
+    pad = width - current
     kv = torch.nn.functional.pad(selection.kv, (0, 0, 0, 0, 0, pad))
     indices = torch.nn.functional.pad(selection.sparse_indices, (0, pad), value=-1)
     return PaBbndSelection(kv, selection.block_table, indices, selection.topk_length)

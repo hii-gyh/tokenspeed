@@ -1815,6 +1815,8 @@ class DeepseekV41DecoderLayer(nn.Module):
             total, maximum = _wide_ep_token_bounds(
                 x.shape[0], x.device, self.comm_manager.mapping
             )
+            # Idle attention groups pass a 0-row tensor. The MoE joins the
+            # same dispatch with one dummy row, because this op rejects batch 0.
             x = self.ffn(
                 x, image_mask, total, maximum, ctx=None, comm_manager=None, out=None
             )
