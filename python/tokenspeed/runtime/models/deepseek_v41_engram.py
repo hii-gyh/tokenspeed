@@ -352,6 +352,30 @@ def _is_host_table_writer(mapping: Mapping) -> bool:
     return mapping.rank % max(mapping.nprocs_per_node, 1) == 0
 
 
+def host_load_barrier(group: tuple[int, ...]) -> None:
+    """Wait until every rank has finished a host-side Engram load.
+
+    vLLM-Ascend and SGLang synchronize this copy on the CPU process group.
+    ``torch.distributed.barrier()`` with no group uses the NPU default, which
+    is HCCL. The first such call creates the communicator, and
+    ``HCCL_CONNECT_TIMEOUT`` expires while slower ranks are still reading the
+    multi-tens-of-GiB tables. The gloo world group already exists and waits
+    for the copy itself.
+    """
+    if (
+        not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size() == 1
+    ):
+        return
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+
+    if not pg_manager.has_process_group("gloo", group):
+        pg_manager.init_process_group(group, backend="gloo")
+    torch.distributed.barrier(group=pg_manager.get_process_group("gloo", group))
+
+
 def resolve_engram_host_layout(host_table: bool, tp_size: int) -> str:
     """Return ``gpu``, ``shared``, or ``sharded`` from the CLI opt-in and TP."""
     if not host_table:
@@ -587,7 +611,7 @@ class RowShardedEngramEmbedding(nn.Module):
                 if self._shared_writer:
                     _create_host_file(weight_path, weight_bytes)
                     _create_host_file(scale_path, scale_bytes)
-                torch.distributed.barrier()
+                host_load_barrier(mapping.world_group)
             weight, weight_mmap = _allocate_host_bytes(
                 weight_shape,
                 weight_dtype,
@@ -608,7 +632,7 @@ class RowShardedEngramEmbedding(nn.Module):
             self.weight = nn.Parameter(weight, requires_grad=False)
             self.scale = nn.Parameter(scale, requires_grad=False)
             if shared_file:
-                torch.distributed.barrier()
+                host_load_barrier(mapping.world_group)
                 if self._shared_writer:
                     _unlink_host_file(weight_path)
                     _unlink_host_file(scale_path)

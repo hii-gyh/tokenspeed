@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os
 from itertools import accumulate
 from typing import TYPE_CHECKING
 
@@ -39,6 +40,20 @@ if TYPE_CHECKING:
 
 
 logger = get_colorful_logger(__name__)
+
+
+def _sync_fence(name: str) -> None:
+    """Synchronize when TOKENSPEED_SYNC_FENCES=1 so the failing op is named.
+
+    A later copy otherwise reports an earlier kernel's ACL error.
+    """
+    if os.getenv("TOKENSPEED_SYNC_FENCES") != "1":
+        return
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.synchronize()
+    elif torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"[fence] {name}", flush=True)
 
 
 class InputBuffers:
@@ -330,6 +345,7 @@ class InputBuffers:
             self.ngram_hash_params,
         )
         self._ngram_active_tokens = total_tokens
+        _sync_fence("after_ngram_prepare")
 
     def _record_pad_tape(self) -> "PrepTape | None":
         """One launch for the whole padding-tail scrub.

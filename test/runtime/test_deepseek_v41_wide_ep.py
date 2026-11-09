@@ -61,6 +61,7 @@ wide_ep_separates_attention = _dispatch.wide_ep_separates_attention
 restore_gathered_tokens = _dispatch.restore_gathered_tokens
 mapping_uses_wide_ep = _dispatch.mapping_uses_wide_ep
 ced_narrowing_needs_row_exchange = _dispatch.ced_narrowing_needs_row_exchange
+wide_ep_dispatch_bounds = _dispatch.wide_ep_dispatch_bounds
 pad_token_dim = _dispatch.pad_token_dim
 unpad_token_dim = _dispatch.unpad_token_dim
 apply_wide_ep_rowwise = _dispatch.apply_wide_ep_rowwise
@@ -268,6 +269,16 @@ def test_gathered_slices_restore_and_one_token_pads():
     sent = expert_dispatch_bytes(padded.shape[0], width, hidden.element_size())
     assert sent == padded.shape[0] * width * hidden.element_size()
     assert sent < sent * _ATTN_TP
+
+
+def test_wide_ep_dispatch_bounds_agree_across_idle_groups():
+    # One attention group holds a token. The other three are idle.
+    counts = [1] * _ATTN_TP + [0] * (_WORLD - _ATTN_TP)
+    total, maximum = wide_ep_dispatch_bounds(counts)
+    assert total == _ATTN_TP
+    assert maximum == 1
+    # A rank that only knows its own zero count would size a different batch.
+    assert wide_ep_dispatch_bounds([0])[1] != maximum
 
 
 def test_wide_ep_narrowing_does_not_wait_for_a_row_exchange():

@@ -96,6 +96,23 @@ def ced_narrowing_needs_row_exchange(
     )
 
 
+def wide_ep_dispatch_bounds(local_counts: list[int]) -> tuple[int, int]:
+    """Return the token sum and the per-rank maximum for one expert group.
+
+    ``npu_moe_distribute_dispatch_v2`` uses ``global_bs = max_per_rank * ep_size``.
+    Every rank must pass that same maximum. A rank that reports only its own
+    count makes idle attention-DP groups disagree, and the dispatch waits
+    until the vector core times out.
+    """
+    if not local_counts:
+        raise ValueError("wide EP dispatch needs one local token count per expert rank")
+    if any(count < 0 for count in local_counts):
+        raise ValueError(
+            f"wide EP token counts must be non-negative, got {local_counts}"
+        )
+    return sum(local_counts), max(local_counts)
+
+
 def mapping_uses_wide_ep(mapping) -> bool:
     """True for attention-TP narrower than a world-sized expert group.
 

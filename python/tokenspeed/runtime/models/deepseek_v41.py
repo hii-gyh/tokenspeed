@@ -160,6 +160,7 @@ from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v41_engram import (
     DeepseekV41Engram,
     EngramHashState,
+    host_load_barrier,
     is_engram_embed_checkpoint_name,
     resolve_engram_host_layout,
 )
@@ -172,6 +173,7 @@ from tokenspeed.runtime.models.deepseek_v41_wide_ep import (
     restore_gathered_tokens,
     split_replicated_tokens,
     unpad_token_dim,
+    wide_ep_dispatch_bounds,
 )
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
@@ -189,6 +191,39 @@ from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
+
+
+def _wide_ep_token_bounds(local: int, device, mapping) -> tuple[int, int]:
+    """All-gather local token counts so every expert rank shares one global batch."""
+    import torch.distributed as dist
+
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+
+    if not dist.is_initialized():
+        return local, local
+    group = pg_manager.get_device_process_group(mapping.moe.ep_group)
+    world = dist.get_world_size(group)
+    if world == 1:
+        return local, local
+    packed = torch.tensor([local], dtype=torch.int32, device=device)
+    gathered = torch.empty(world, dtype=torch.int32, device=device)
+    dist.all_gather_into_tensor(gathered, packed, group=group)
+    return wide_ep_dispatch_bounds([int(value) for value in gathered.tolist()])
+
+
+def _sync_fence(name: str) -> None:
+    """Synchronize when TOKENSPEED_SYNC_FENCES=1 so the failing op is named."""
+    if os.getenv("TOKENSPEED_SYNC_FENCES") != "1":
+        return
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.synchronize()
+    elif torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"[fence] {name}", flush=True)
+
+
 _ROPE_TABLES = WeakValueDictionary()
 
 
@@ -1777,7 +1812,9 @@ class DeepseekV41DecoderLayer(nn.Module):
                 image_mask = split_replicated_tokens(
                     image_mask, attn.tp_rank, attn.tp_size
                 )
-            total, maximum = x.shape[0], x.shape[0]
+            total, maximum = _wide_ep_token_bounds(
+                x.shape[0], x.device, self.comm_manager.mapping
+            )
             x = self.ffn(
                 x, image_mask, total, maximum, ctx=None, comm_manager=None, out=None
             )
@@ -2120,6 +2157,7 @@ class DeepseekV41Model(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, V41HCPost | None]:
         """Finish an incoming post before Engram; capture the input after it."""
         if layer.engram is not None:
+            _sync_fence(f"before_engram_layer_{layer.layer_id}")
             if pending_post is not None:
                 hidden = pending_post.finish(hidden)
                 pending_post = None
@@ -2186,6 +2224,7 @@ class DeepseekV41Model(nn.Module):
                     "Engram prepared hashes/mask have the wrong shape or dtype"
                 )
         h = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+        _sync_fence("after_token_embed")
         if h.shape != (input_ids.numel(), self.config.hidden_size):
             raise ValueError("V4.1 input embeddings have the wrong shape")
         if h.is_cuda:
@@ -3010,8 +3049,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             with safe_open(shard, framework="pt", device="cpu") as handle:
                 embed.load_sharded(field, handle.get_slice(mapped), 65536)
             loaded.add(raw)
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        if self.model is not None:
+            host_load_barrier(self.model.mapping.world_group)
 
     def post_load_weights(self) -> None:
         for module in self.modules():

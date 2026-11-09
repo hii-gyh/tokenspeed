@@ -330,6 +330,74 @@ def _prepare_ngram_hash(
                     tl.store(prefix + rows * 3 + col, value, empty)
 
 
+def _prepare_ngram_inputs_on_host(
+    snapshots: torch.Tensor,
+    positions: torch.Tensor,
+    reset: torch.Tensor,
+    slots: torch.Tensor,
+    cache_lengths: torch.Tensor,
+    request_ends: torch.Tensor,
+    tail: torch.Tensor,
+    needs_seed: torch.Tensor,
+    ids: torch.Tensor,
+    previous: torch.Tensor,
+    token_mask: torch.Tensor,
+    prefix: torch.Tensor,
+    hashes: torch.Tensor,
+    total: int,
+    vocab_size: int,
+    uniform_length: int,
+    hash_params: NGramHashParams,
+) -> None:
+    """Run the reference n-gram hash on the CPU and copy the int64 ids back.
+
+    Isolated int64 remainder and copy succeed on NPU. The full forward still
+    reports ACL 507034 at the first later sync, so this reference stays off
+    the model stream. The host result is copied onto the caller's buffers.
+    """
+
+    def host(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.detach().to(device="cpu")
+
+    params = hash_params
+    if params.token_map.device.type != "cpu":
+        params = NGramHashParams(
+            host(params.token_map),
+            host(params.primes),
+            host(params.reciprocals),
+            host(params.offsets),
+            host(params.multipliers),
+            params.pad_id,
+        )
+    previous_h = host(previous)
+    mask_h = host(token_mask)
+    prefix_h = host(prefix)
+    hashes_h = host(hashes)
+    prepare_ngram_inputs(
+        host(snapshots),
+        host(positions),
+        host(reset),
+        host(slots),
+        host(cache_lengths),
+        host(request_ends),
+        host(tail),
+        host(needs_seed),
+        host(ids),
+        previous_h,
+        mask_h,
+        prefix_h,
+        hashes_h,
+        total,
+        vocab_size,
+        uniform_length,
+        params,
+    )
+    previous.copy_(previous_h)
+    token_mask.copy_(mask_h)
+    prefix.copy_(prefix_h)
+    hashes.copy_(hashes_h)
+
+
 def prepare_ngram_inputs(
     snapshots: torch.Tensor,
     positions: torch.Tensor,
@@ -364,6 +432,27 @@ def prepare_ngram_inputs(
     """
     bs = slots.numel()
     if not ids.is_cuda:
+        if ids.device.type != "cpu":
+            _prepare_ngram_inputs_on_host(
+                snapshots,
+                positions,
+                reset,
+                slots,
+                cache_lengths,
+                request_ends,
+                tail,
+                needs_seed,
+                ids,
+                previous,
+                token_mask,
+                prefix,
+                hashes,
+                total,
+                vocab_size,
+                uniform_length,
+                hash_params,
+            )
+            return
         seed = reset.bool() | needs_seed[slots]
         delta = cache_lengths[slots] - positions
         torch._assert_async(

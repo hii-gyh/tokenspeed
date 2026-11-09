@@ -1005,7 +1005,32 @@ def test_host_table_job_id_is_pid_scoped(tmp_path, monkeypatch):
     engram._HOST_TABLE_JOB_ID = None
 
 
-def test_checkpoint_filter_skips_engram_embed_only():
+def test_host_load_barrier_uses_the_cpu_group(monkeypatch):
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+    from tokenspeed.runtime.models.deepseek_v41_engram import host_load_barrier
+
+    seen = {}
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+    monkeypatch.setattr(
+        pg_manager, "has_process_group", lambda backend, group: backend == "gloo"
+    )
+    def get_process_group(backend, group):
+        seen["group"] = (backend, group)
+        return "cpu-group"
+
+    monkeypatch.setattr(pg_manager, "get_process_group", get_process_group)
+
+    def barrier(group=None):
+        seen["barrier"] = group
+
+    monkeypatch.setattr(torch.distributed, "barrier", barrier)
+    host_load_barrier((0, 1, 2, 3))
+    assert seen["group"] == ("gloo", (0, 1, 2, 3))
+    assert seen["barrier"] == "cpu-group"
     from tokenspeed.runtime.models.deepseek_v41_engram import (
         is_engram_embed_checkpoint_name,
     )
