@@ -371,6 +371,31 @@ def test_wide_ep_mapping_requires_world_sized_expert_group():
     assert not mapping_uses_wide_ep(matched)
 
 
+def test_wide_ep_shared_expert_keeps_a_full_local_copy():
+    """Row-split MoE cannot also shard shared weights on the attention TP group.
+
+    The gather after dispatch only restores token order. An unreduced shared
+    partial would stay wrong for every row. The MoE constructor therefore
+    passes ``replicate_weights=True`` exactly when ``mapping_uses_wide_ep``.
+    """
+    wide = _wide_mapping(0)
+    matched = Mapping(
+        rank=0,
+        world_size=8,
+        attn_tp_size=8,
+        attn_dp_size=1,
+        dense_tp_size=8,
+        moe_tp_size=1,
+        moe_ep_size=8,
+    )
+    assert mapping_uses_wide_ep(wide)
+    assert not mapping_uses_wide_ep(matched)
+    # Dense TP on the wide mapping is the attention width that already owns the
+    # row split; shared experts must not reuse it for a second shard.
+    assert wide.dense.tp_size == _ATTN_TP
+    assert wide.attn.tp_size == _ATTN_TP
+
+
 def test_split_copies_one_share_not_the_whole_replica():
     tokens = 256
     hidden = torch.randn(tokens, _HIDDEN, dtype=torch.bfloat16)

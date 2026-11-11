@@ -1405,7 +1405,7 @@ def _uses_all_to_all_ep(a2a_backend: str | None) -> bool:
 
 
 def _validate_a2a_backend(a2a_backend: str | None) -> None:
-    if a2a_backend in {None, "none", "deepep", "gluon_petit"}:
+    if a2a_backend in {None, "none", "deepep", "gluon_petit", "ascend"}:
         return
     raise NotImplementedError(f"MoE all-to-all backend is unsupported: {a2a_backend}")
 
@@ -1852,8 +1852,9 @@ def moe_plan(
             weights (for models whose routing function the fused kernels
             cannot reproduce); "kernel_routing" requires in-kernel routing
             from logits. None (default) leaves routing mode unconstrained.
-        a2a_backend: Optional all-to-all backend. deepep selects the DeepEP
-            solution when solution is not set.
+        a2a_backend: Optional all-to-all backend. ``deepep`` and
+            ``gluon_petit`` select those transports. ``ascend`` selects the
+            Ascend HCCL kernel, which declares ``a2a_backend={"ascend"}``.
         ep_size: Optional expert-parallel size. Values > 1 require EP support.
             The exact value is also passed as a selection trait when a kernel
             declares an ``ep_size`` constraint.

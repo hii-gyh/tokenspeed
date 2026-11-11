@@ -226,6 +226,10 @@ class MoELayer(torch.nn.Module):
 
         fp8_scale_block_shape = None
         internal_activation_dtype = "input"
+        if self._quant_kind == "int8":
+            # Ascend W8A8 experts quantize tokens with npu_dynamic_quant before
+            # the NZ GMMs; the registered INT8 apply kernels declare this.
+            internal_activation_dtype = "int8"
         if self._quant_kind == "fp8":
             fp8_scale_block_shape = tuple(self.quant_config.weight_block_size)
             # The loader slices each rank's block scales at ceil(ispp / block)
@@ -542,6 +546,10 @@ class MoELayer(torch.nn.Module):
         self.plan["cutlass_fused_finalize"] = global_server_args_dict[
             "moe_cutlass_fused_finalize"
         ]
+        # Ascend INT8 MoE reads this for DeepSeek V4 finite SwiGLU clamp.
+        self.plan["swiglu_limit"] = (
+            None if self.swiglu_arg is None else self.swiglu_arg.limit
+        )
         if precision_policy == "bf16_route_accum_fp32":
             if self.plan["apply_kernel_name"] != "triton_bf16_precomputed_moe_apply":
                 raise ValueError(

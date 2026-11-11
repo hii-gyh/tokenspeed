@@ -25,6 +25,10 @@ hidden rows. An expert group that spans several replicas must send each row
 once. vLLM's data-parallel plus tensor-parallel expert dispatch has the same
 volume: ``num_tokens * hidden * dtype_bytes`` each way, per layer.
 
+After the row split, shared experts cannot reuse that attention TP group for
+weight sharding: there is no matching all-reduce before the token gather, so
+they keep a full local copy and finish each local row.
+
 The dispatch itself follows vLLM-Ascend's uneven path and the SGLang tiling
 contract: every expert rank enters one ``npu_moe_distribute_dispatch_v2``, and
 ``global_bs`` is the per-rank maximum times the expert-parallel size. This A2

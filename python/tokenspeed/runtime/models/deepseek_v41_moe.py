@@ -87,14 +87,31 @@ class DeepseekV4MLP(nn.Module):
         swiglu_limit: float | None = None,
         reduce_results: bool = False,
         is_shared_expert: bool = False,
+        *,
+        replicate_weights: bool = False,
     ) -> None:
         super().__init__()
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}")
-        tp = mapping.moe if is_shared_expert else mapping.dense
-        tp_rank = tp.tp_ep_rank if is_shared_expert else tp.tp_rank
-        tp_size = tp.tp_ep_size if is_shared_expert else tp.tp_size
-        tp_group = tp.tp_ep_group if is_shared_expert else tp.tp_group
+        if replicate_weights and is_shared_expert:
+            raise ValueError(
+                "replicate_weights keeps a full local copy; it cannot combine "
+                "with is_shared_expert tensor/expert parallelism"
+            )
+        if replicate_weights:
+            # Wide EP already splits the replicated attention rows across the
+            # attention TP group before MoE. Shared experts on that path must
+            # finish each local row completely: sharding the same TP group a
+            # second time would leave an unreduced partial and never meet the
+            # matching all-reduce (the wide-EP gather only restores token order).
+            tp_rank = 0
+            tp_size = 1
+            tp_group = None
+        else:
+            tp = mapping.moe if is_shared_expert else mapping.dense
+            tp_rank = tp.tp_ep_rank if is_shared_expert else tp.tp_rank
+            tp_size = tp.tp_ep_size if is_shared_expert else tp.tp_size
+            tp_group = tp.tp_ep_group if is_shared_expert else tp.tp_group
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
@@ -340,6 +357,7 @@ class DeepseekV4MoE(nn.Module):
         )
 
         if config.n_shared_experts is not None:
+            wide_ep = mapping_uses_wide_ep(mapping)
             self.shared_experts = DeepseekV4MLP(
                 config.hidden_size,
                 config.moe_intermediate_size * config.n_shared_experts,
@@ -350,14 +368,15 @@ class DeepseekV4MoE(nn.Module):
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 reduce_results=False,
                 # Normal EP sums routed and shared partials over the same TPxEP
-                # group. Wide EP keeps the shared expert on the attention TP
-                # group: the expert group is wider and holds other replicas.
+                # group. Wide EP has already sliced the attention replica's rows
+                # across that TP group, so the shared expert must own a full
+                # local copy and finish each row without a second shard.
                 # Fused MegaMoE paths return complete routed outputs and
-                # therefore keep the shared expert dense and local.
+                # therefore keep the shared expert on the dense TP group.
                 is_shared_expert=(
-                    not (self.use_mega_moe or self.use_gluon_petit)
-                    and not mapping_uses_wide_ep(mapping)
+                    not (self.use_mega_moe or self.use_gluon_petit) and not wide_ep
                 ),
+                replicate_weights=wide_ep,
             )
         else:
             self.shared_experts = None

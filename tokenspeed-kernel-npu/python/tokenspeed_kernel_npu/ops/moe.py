@@ -360,6 +360,110 @@ def ascend_bf16_precomputed_moe_apply(
     )
 
 
+def _swiglu_clamp_limit(plan: dict, w: torch.nn.Module) -> float | None:
+    """DeepSeek V4 finite SwiGLU clamp, or None when the fused op is enough."""
+    limit = plan.get("swiglu_limit")
+    if limit is None:
+        arg = getattr(w, "swiglu_arg", None)
+        limit = None if arg is None else arg.limit
+    if limit is None:
+        return None
+    value = float(limit)
+    return value if value > 0.0 else None
+
+
+def _expand_expert_scales(
+    weight_scale: torch.Tensor, expert_counts: torch.Tensor
+) -> torch.Tensor:
+    """Repeat each expert's channel scales for that expert's expanded rows."""
+    counts = expert_counts.tolist()
+    if not any(counts):
+        return weight_scale.new_empty((0, weight_scale.shape[-1]))
+    parts = [
+        weight_scale[expert].expand(count, -1)
+        for expert, count in enumerate(counts)
+        if count
+    ]
+    return torch.cat(parts, dim=0)
+
+
+def _ascend_int8_dequant_swiglu_quant(
+    hidden_i32: torch.Tensor,
+    weight_scale: torch.Tensor,
+    activation_scale: torch.Tensor,
+    expert_counts: torch.Tensor,
+    *,
+    quant_scale: torch.Tensor | None,
+    limit: float | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dequant INT32 gate/up, SwiGLU, and per-token INT8 requant.
+
+    When ``limit`` is set, apply DeepSeek V4 clamp ordering explicitly:
+    ``gate.clamp_max(limit)``, ``up.clamp(-limit, limit)``, then
+    ``silu(gate) * up``. Fused ``npu_dequant_swiglu_quant`` clamp modes do not
+    match that contract (see vLLM-Ascend DeepSeek V4 SwiGLU issues).
+
+    Ascend MC2 dispatch may size the token axis to a capacity that is larger
+    than ``sum(expert_counts)``. The fused op only touches the live packed
+    prefix and leaves the suffix undefined; the clamp path must do the same
+    instead of broadcasting expert scales across the whole capacity buffer.
+    """
+    if limit is None:
+        return torch_npu.npu_dequant_swiglu_quant(
+            hidden_i32,
+            weight_scale=weight_scale,
+            activation_scale=activation_scale,
+            bias=None,
+            quant_scale=quant_scale,
+            quant_offset=None,
+            group_index=expert_counts,
+            activate_left=True,
+            quant_mode=1,
+        )
+    if quant_scale is not None:
+        raise ValueError(
+            "Ascend W8A8 MoE SwiGLU clamp does not combine with w2 smooth scales"
+        )
+    tokens = hidden_i32.shape[0]
+    total = int(expert_counts.to(torch.int64).sum().item())
+    if total > tokens:
+        raise ValueError(
+            "Ascend W8A8 MoE SwiGLU clamp expert counts exceed the token buffer"
+        )
+    width = hidden_i32.shape[-1] // 2
+    if total == 0:
+        return (
+            hidden_i32.new_zeros((tokens, width), dtype=torch.int8),
+            hidden_i32.new_ones((tokens,), dtype=torch.float32),
+        )
+    # activation_scale may be [TokensNum] or [TokensNum, 1]; keep it rank-1 so
+    # unsqueeze(-1) stays a column broadcast against [total, channels].
+    act = activation_scale.float().reshape(-1)
+    if act.numel() < total:
+        raise ValueError(
+            "Ascend W8A8 MoE SwiGLU clamp activation scales are shorter than "
+            "the live expert rows"
+        )
+    row_scale = _expand_expert_scales(weight_scale.float(), expert_counts)
+    gate_up = (
+        hidden_i32[:total].float() * act[:total].unsqueeze(-1) * row_scale
+    ).to(dtype=torch.bfloat16)
+    gate, up = gate_up.chunk(2, dim=-1)
+    gate = gate.clamp_max(limit)
+    up = up.clamp(-limit, limit)
+    mid = torch.nn.functional.silu(gate) * up
+    mid_q, mid_s = torch_npu.npu_dynamic_quant(mid)
+    if mid_q.shape[0] == tokens:
+        return mid_q, mid_s
+    # Match the fused op's output geometry: full capacity rows, live prefix
+    # filled, unused suffix left inert for the grouped down-projection.
+    out_q = mid_q.new_zeros((tokens, mid_q.shape[-1]))
+    out_s = mid_s.new_ones((tokens,))
+    out_q[:total] = mid_q
+    out_s[:total] = mid_s
+    return out_q, out_s
+
+
 def ascend_int8_precomputed_moe_apply(
     plan: dict,
     x: torch.Tensor,
@@ -450,16 +554,13 @@ def ascend_int8_precomputed_moe_apply(
         group_type=0,
         group_list_type=1,
     )[0]
-    hidden, hidden_scale = torch_npu.npu_dequant_swiglu_quant(
+    hidden, hidden_scale = _ascend_int8_dequant_swiglu_quant(
         hidden,
-        weight_scale=w.w13_weight_scale,
-        activation_scale=activation_scale,
-        bias=None,
+        w.w13_weight_scale,
+        activation_scale,
+        expert_counts,
         quant_scale=getattr(w, "w2_smooth_scale", None),
-        quant_offset=None,
-        group_index=expert_counts,
-        activate_left=True,
-        quant_mode=1,
+        limit=_swiglu_clamp_limit(plan, w),
     )
     return _ascend_int8_gmm2_finalize(
         hidden, hidden_scale, expert_counts, row_indices, ids, topk_weights, w
@@ -665,6 +766,7 @@ def _ascend_int8_expert_gmm_from_bf16(
     expanded: torch.Tensor,
     expert_counts: torch.Tensor,
     w: torch.nn.Module,
+    plan: dict,
 ) -> torch.Tensor:
     """Dynamic-quant BF16 tokens through local INT8 NZ expert GMMs."""
     if expanded.numel() == 0:
@@ -686,16 +788,13 @@ def _ascend_int8_expert_gmm_from_bf16(
         group_type=0,
         group_list_type=1,
     )[0]
-    hidden, hidden_scale = torch_npu.npu_dequant_swiglu_quant(
+    hidden, hidden_scale = _ascend_int8_dequant_swiglu_quant(
         hidden,
-        weight_scale=w.w13_weight_scale,
-        activation_scale=activation_scale,
-        bias=None,
+        w.w13_weight_scale,
+        activation_scale,
+        expert_counts,
         quant_scale=getattr(w, "w2_smooth_scale", None),
-        quant_offset=None,
-        group_index=expert_counts,
-        activate_left=True,
-        quant_mode=1,
+        limit=_swiglu_clamp_limit(plan, w),
     )
     return torch_npu.npu_grouped_matmul(
         [hidden],
@@ -826,7 +925,9 @@ def ascend_int8_distributed_precomputed_moe_apply(
             expert_token_nums_type=1,
             comm_alg="fullmesh",
         )
-        hidden = _ascend_int8_expert_gmm_from_bf16(dispatch[0], dispatch[3], chunk)
+        hidden = _ascend_int8_expert_gmm_from_bf16(
+            dispatch[0], dispatch[3], chunk, plan
+        )
         outputs.append(
             torch_npu.npu_moe_distribute_combine_v2(
                 expand_x=hidden,

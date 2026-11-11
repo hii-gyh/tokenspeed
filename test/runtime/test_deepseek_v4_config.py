@@ -638,6 +638,46 @@ class TestDeepseekV4Config:
         assert (shared_mlp.tp_group) == (mapping.dense.tp_group)
         assert (shared_mlp.tp_size) != (mapping.moe.tp_ep_size)
 
+    def test_deepseek_v4_shared_mlp_replicate_weights_is_local(self):
+        mapping = Mapping(
+            rank=3,
+            world_size=32,
+            attn_tp_size=8,
+            attn_dp_size=4,
+            dense_tp_size=8,
+            dense_dp_size=4,
+            moe_tp_size=1,
+            moe_ep_size=32,
+            moe_dp_size=1,
+        )
+        shared_mlp = DeepseekV4MLP(
+            hidden_size=8,
+            intermediate_size=16,
+            hidden_act="silu",
+            mapping=mapping,
+            quant_config=None,
+            prefix="model.layers.0.ffn.shared_experts",
+            reduce_results=False,
+            is_shared_expert=False,
+            replicate_weights=True,
+        )
+        assert shared_mlp.tp_rank == 0
+        assert shared_mlp.tp_size == 1
+        assert shared_mlp.tp_group is None
+        assert shared_mlp.gate_up_proj.tp_size == 1
+        assert shared_mlp.down_proj.tp_size == 1
+        with pytest.raises(ValueError, match="replicate_weights"):
+            DeepseekV4MLP(
+                hidden_size=8,
+                intermediate_size=16,
+                hidden_act="silu",
+                mapping=mapping,
+                quant_config=None,
+                prefix="bad",
+                is_shared_expert=True,
+                replicate_weights=True,
+            )
+
     def _make_fake_mega_deepseek_v4_moe(
         self, hidden_states, input_ids, shared_experts, calls
     ):
