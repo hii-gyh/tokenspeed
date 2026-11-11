@@ -162,6 +162,7 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     EngramHashState,
     host_load_barrier,
     is_engram_embed_checkpoint_name,
+    load_engram_rotation_block,
     resolve_engram_host_layout,
 )
 from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MLP, DeepseekV4MoE
@@ -1392,7 +1393,12 @@ class DeepseekV41MoE(DeepseekV4MoE):
 
     def _routing_inputs(self, hidden_states, image_mask):
         bias_vl = self.gate.bias_vl
-        if hidden_states.is_cuda and (bias_vl is None or image_mask is None):
+        # Text-only (or no image rows): keep the base gate / hash-MoE path on
+        # CUDA and Ascend. ``is_cuda`` alone left NPU on the vision fork that
+        # drops ``tid2eid`` / ``input_ids``.
+        if _on_accelerator(hidden_states) and (
+            bias_vl is None or image_mask is None
+        ):
             return super()._routing_inputs(hidden_states, None)
         bias = self.gate.e_score_correction_bias
         if bias_vl is not None and image_mask is not None:
@@ -1403,7 +1409,7 @@ class DeepseekV41MoE(DeepseekV4MoE):
     def _compute_topk_output(self, hidden_states, image_mask):
         gate, config = self.gate, self.topk.topk_config
         if (
-            hidden_states.is_cuda
+            _on_accelerator(hidden_states)
             and (gate.bias_vl is None or image_mask is None)
             and gate.tid2eid is None
             and not self.topk.simulate_routing
@@ -2556,6 +2562,14 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
 
     def bind_checkpoint_dir(self, checkpoint_dir: str) -> None:
         self._checkpoint_dir = checkpoint_dir
+        if self.model is None:
+            return
+        block = load_engram_rotation_block(
+            checkpoint_dir, self.model.config.hidden_size
+        )
+        for layer in self.model.layers:
+            if layer.engram is not None:
+                layer.engram.set_rotation_block(block)
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         if self.encoder_only:

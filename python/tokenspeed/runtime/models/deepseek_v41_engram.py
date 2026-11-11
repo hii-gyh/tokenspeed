@@ -35,7 +35,11 @@ Integration contract:
   INT8 gathers on the CPU table, then dequantizes on the activation device.
   ``shared`` keeps one full copy per node and skips the lookup all-reduce.
   ``sharded`` keeps a host shard per attention-TP rank and retains the all-reduce.
-  ``auto`` selects sharded when attention TP > 1. Output matches the GPU path.
+  ``auto`` selects sharded when attention TP > 1 on CUDA, and shared on Ascend
+  (one-shot AR lanes are not armed there). Output matches the GPU path.
+  Ascend W8A8 checkpoints may ship ``optional/quarot.safetensors``; the gate
+  undoes the repeated block-32 ``global_rotation`` on the residual before the
+  normed dot, matching vLLM-Ascend.
 * Intercept embed.weight/scale BEFORE a generic GPU weight iterator. Open the
   safetensors file on CPU, pass get_slice(name) to embed.load_sharded(), and mark
   the corresponding runtime parameter name loaded. GPU and host-sharded tables
@@ -384,13 +388,50 @@ def resolve_engram_host_layout(host_table: bool, tp_size: int) -> str:
         raise ValueError("Engram host layout requires a positive attention TP size")
     requested = global_server_args_dict["engram_host_table_layout"]
     if requested == "auto":
-        return "sharded" if tp_size > 1 else "shared"
+        # Ascend cannot arm the one-shot Engram embed lane; shared skips the
+        # TP all-reduce that otherwise falls back to a slow device collective.
+        if tp_size > 1 and not current_platform().is_npu:
+            return "sharded"
+        return "shared"
     if requested in ("shared", "sharded"):
         return requested
     raise ValueError(
         "engram_host_table_layout must be auto, shared, or sharded; "
         f"got {requested!r}"
     )
+
+
+def load_engram_rotation_block(
+    checkpoint_dir: str, hidden_size: int
+) -> torch.Tensor | None:
+    """Return the 32×32 QuaRot block for Engram gating, or None if unused.
+
+    Ascend W8A8 packs store ``optional/quarot.safetensors`` with a
+    ``global_rotation`` that is the same 32×32 block tiled across hidden_size.
+    Missing file means the gate runs in the residual basis (BF16 / GPU packs).
+    """
+    if hidden_size < _ENGRAM_SCALE_GROUP or hidden_size % _ENGRAM_SCALE_GROUP:
+        raise ValueError(
+            "Engram QuaRot undo requires hidden_size divisible by 32; "
+            f"got {hidden_size}"
+        )
+    rotation_path = os.path.join(checkpoint_dir, "optional", "quarot.safetensors")
+    if not os.path.isfile(rotation_path):
+        return None
+    from safetensors import safe_open
+
+    with safe_open(rotation_path, framework="pt") as checkpoint:
+        rotation = checkpoint.get_tensor("global_rotation")
+    if rotation.ndim != 2 or rotation.shape[0] != hidden_size:
+        raise ValueError(
+            "Engram global_rotation must be [hidden_size, hidden_size]; "
+            f"got {tuple(rotation.shape)} for hidden_size={hidden_size}"
+        )
+    block = rotation[:_ENGRAM_SCALE_GROUP, :_ENGRAM_SCALE_GROUP].contiguous().float()
+    expected = torch.block_diag(*([block] * (hidden_size // _ENGRAM_SCALE_GROUP)))
+    if not torch.equal(rotation.float(), expected):
+        raise ValueError("Engram gate requires repeated block-32 global_rotation")
+    return block
 
 
 def _cleanup_host_files() -> None:
@@ -939,6 +980,8 @@ class DeepseekV41Engram(nn.Module):
         )
         self.q_weight.weight_loader = default_weight_loader
         self.k_weight.weight_loader = default_weight_loader
+        # Optional QuaRot undo for Ascend W8A8; bind_checkpoint_dir fills this.
+        self.rotation_block: torch.Tensor | None = None
         # The embedding reduces [tokens, n_hash_cols * head_dim] across attention
         # TP; widen the one-shot lane to that width so decode batches take the
         # workspace kernel. Collective: every rank builds the same layers.
@@ -955,8 +998,25 @@ class DeepseekV41Engram(nn.Module):
             if not self.reduce_lane_armed:
                 logger.warning(
                     f"{prefix!s}: one-shot all-reduce lane of width {width:d} not "
-                    "armed; the Engram embedding reduce falls back to NCCL"
+                    "armed; the Engram embedding reduce falls back to the device "
+                    "collective"
                 )
+
+    def set_rotation_block(self, block: torch.Tensor | None) -> None:
+        """Install the 32×32 QuaRot block used to undo checkpoint rotation."""
+        if block is None:
+            self.rotation_block = None
+            return
+        if (
+            block.ndim != 2
+            or block.shape[0] != block.shape[1]
+            or block.shape[0] != _ENGRAM_SCALE_GROUP
+        ):
+            raise ValueError(
+                "Engram rotation_block must be [32, 32]; "
+                f"got {tuple(block.shape)}"
+            )
+        self.rotation_block = block.detach().float().contiguous()
 
     def checkpoint_weight_aliases(self) -> dict[str, str]:
         """Return raw layers.<id>.engram checkpoint names to runtime param paths.
@@ -989,6 +1049,8 @@ class DeepseekV41Engram(nn.Module):
         hash_ids contains this layer's [..., n_hash_cols] IDs; token_mask is bool
         [...]. False positions pass through unchanged, including image/pad rows.
         Norms and gates accumulate in FP32, independently for each HC copy.
+        When ``rotation_block`` is set, the residual is undone into the original
+        basis for the normed-dot only; the value add stays in the residual basis.
         """
         shape = hidden_states.shape[:-2]
         if (
@@ -1003,7 +1065,9 @@ class DeepseekV41Engram(nn.Module):
             return hidden_states
         embeddings = self.embed(hash_ids).flatten(-2)
         kv, _ = self.wkv(embeddings, block_scale=None, output_dtype=None)
-        if hidden_states.is_cuda:
+        # Fused CUDA gate has no QuaRot undo; match vLLM and take the torch path
+        # whenever the checkpoint declares a rotation block.
+        if hidden_states.is_cuda and self.rotation_block is None:
             from tokenspeed_kernel.ops.residual import normalized_dot_gate
 
             return normalized_dot_gate(
@@ -1012,11 +1076,17 @@ class DeepseekV41Engram(nn.Module):
         key, value = kv.split([self.hc_mult * self.dim, self.dim], dim=-1)
         key = key.float().unflatten(-1, (self.hc_mult, self.dim))
         h = hidden_states.float()
+        original = h
+        if self.rotation_block is not None:
+            block = self.rotation_block.to(device=h.device, dtype=torch.float32)
+            original = (
+                original.unflatten(-1, (-1, block.shape[0])) @ block.T
+            ).flatten(-2)
         weight = self.q_weight.float() * self.k_weight.float()
-        rstd = torch.rsqrt(h.square().mean(-1) + self.eps) * torch.rsqrt(
+        rstd = torch.rsqrt(original.square().mean(-1) + self.eps) * torch.rsqrt(
             key.square().mean(-1) + self.eps
         )
-        dot = (h * weight * key).sum(-1) * rstd * self.dim**-0.5
+        dot = (original * weight * key).sum(-1) * rstd * self.dim**-0.5
         gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
         gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
         return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(

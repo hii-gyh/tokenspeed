@@ -58,6 +58,7 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     _dequant_int8_group32,
     build_compressed_token_map,
     compute_hash_multipliers,
+    load_engram_rotation_block,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -523,6 +524,51 @@ def test_gate_matches_reference_and_mask_is_identity():
     torch.testing.assert_close(
         model(hidden, ids, torch.ones_like(mask)), expected, rtol=0, atol=0
     )
+
+
+def test_gate_undoes_quarot_block_on_residual_only():
+    """Ascend W8A8: gate dots in the original basis; value adds stay residual."""
+    torch.manual_seed(7)
+    model = _model("cpu", None)
+    codes, scales = _weights(72, 32)
+    model.embed.weight_loader(model.embed.weight, codes)
+    model.embed.weight_loader(model.embed.scale, scales)
+    model.wkv.weight.data.copy_(torch.randn(160, 192) * 0.03)
+    model.q_weight.data.copy_(torch.randn(4, 32))
+    model.k_weight.data.copy_(torch.randn(4, 32))
+    # Orthogonal-ish 32x32 block; not identity so undo changes the gate.
+    block = torch.linalg.qr(torch.randn(32, 32))[0].float()
+    model.set_rotation_block(block)
+    ids = torch.randint(72, (2, 3, 6))
+    hidden = torch.randn(2, 3, 4, 32, dtype=torch.bfloat16)
+    mask = torch.ones(2, 3, dtype=torch.bool)
+    kv = F.linear(_dequant(codes, scales)[ids].flatten(-2), model.wkv.weight)
+    key, value = kv[..., :128].float().reshape(2, 3, 4, 32), kv[..., 128:].float()
+    h = hidden.float()
+    original = (h.unflatten(-1, (-1, 32)) @ block.T).flatten(-2)
+    qnorm = original * torch.rsqrt(original.square().mean(-1, keepdim=True) + 1e-20)
+    knorm = key * torch.rsqrt(key.square().mean(-1, keepdim=True) + 1e-20)
+    dot = (qnorm * model.q_weight.float() * knorm * model.k_weight.float()).sum(
+        -1
+    ) / 32**0.5
+    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+    expected = (h + gate.unsqueeze(-1) * value.unsqueeze(-2)).to(hidden.dtype)
+    torch.testing.assert_close(model(hidden, ids, mask), expected, rtol=0, atol=0)
+    # Without undo the gate would differ for a non-identity block.
+    model.set_rotation_block(None)
+    assert not torch.allclose(model(hidden, ids, mask), expected, rtol=0, atol=0)
+
+
+def test_load_engram_rotation_block_accepts_tiled_global(tmp_path: Path):
+    block = torch.linalg.qr(torch.randn(32, 32))[0].float()
+    global_rotation = torch.block_diag(*([block] * 2))
+    optional = tmp_path / "optional"
+    optional.mkdir()
+    save_file({"global_rotation": global_rotation}, optional / "quarot.safetensors")
+    loaded = load_engram_rotation_block(str(tmp_path), hidden_size=64)
+    assert loaded is not None
+    torch.testing.assert_close(loaded, block, rtol=0, atol=0)
+    assert load_engram_rotation_block(str(tmp_path / "missing"), 64) is None
 
 
 @pytest.mark.parametrize("config_class", [Fp8Config, Mxfp8Config])

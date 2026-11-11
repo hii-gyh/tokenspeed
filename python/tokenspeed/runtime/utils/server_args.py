@@ -999,6 +999,10 @@ class ServerArgs:
                 self.sampling_backend = "flashinfer"
             elif current_platform().is_npu:
                 self.sampling_backend = "ascend_full"
+                # vLLM-Ascend and the trainer build YaRN inv-freq on the host;
+                # NPU division of the ramp table rounds differently at ulp level.
+                if self.yarn_ramp_mask_device == "cuda":
+                    self.yarn_ramp_mask_device = "cpu"
             else:
                 self.sampling_backend = "greedy"
 
