@@ -101,6 +101,56 @@ def test_gather_from_a_large_pool_touches_only_selected_slots():
     assert int(changed.sum()) <= slots.numel() * row_bytes
 
 
+def test_scatter_leaves_invalid_slots_unread():
+    fmt, dim, row_bytes = "index", 128, 68
+    torch.manual_seed(3)
+    rows = torch.randn(3, dim, dtype=torch.bfloat16)
+    cache = torch.full((2, 64, row_bytes), 0x11, dtype=torch.uint8)
+    before = cache.clone()
+    slots = torch.tensor([-1, -64, 10_000], dtype=torch.int64)
+    _mod.cache_scatter_torch(rows, cache, slots, fmt)
+    assert torch.equal(cache, before)
+
+
+def test_invalid_slot_does_not_clobber_the_row_it_aliases():
+    fmt, dim, row_bytes = "index", 128, 68
+    torch.manual_seed(4)
+    # slot -1 addresses page 0 row 63, the same row as slot 63.
+    rows = torch.randn(2, dim, dtype=torch.bfloat16)
+    cache = torch.zeros(1, 64, row_bytes, dtype=torch.uint8)
+    slots = torch.tensor([63, -1], dtype=torch.int64)
+    _mod.cache_scatter_torch(rows, cache, slots, fmt)
+    got = _mod.cache_gather_torch(cache, slots[:1], fmt, None)
+    expect = _mod.cache_unpack_torch(_mod.cache_pack_torch(rows[:1], fmt, None), fmt, None)
+    assert torch.equal(got, expect)
+
+    cache.zero_()
+    slots = torch.tensor([-1, 63], dtype=torch.int64)
+    _mod.cache_scatter_torch(rows, cache, slots, fmt)
+    got = _mod.cache_gather_torch(cache, slots[1:], fmt, None)
+    expect = _mod.cache_unpack_torch(_mod.cache_pack_torch(rows[1:], fmt, None), fmt, None)
+    assert torch.equal(got, expect)
+
+
+def test_duplicate_slot_keeps_the_later_row():
+    fmt, dim, row_bytes = "swa", 512, 528
+    torch.manual_seed(5)
+    rows = torch.randn(2, dim, dtype=torch.bfloat16)
+    cache = torch.zeros(1, 64, row_bytes, dtype=torch.uint8)
+    slots = torch.tensor([4, 4], dtype=torch.int64)
+    _mod.cache_scatter_torch(rows, cache, slots, fmt)
+    got = _mod.cache_gather_torch(cache, slots[:1], fmt, None)
+    expect = _mod.cache_unpack_torch(_mod.cache_pack_torch(rows[1:], fmt, None), fmt, None)
+    assert torch.equal(got, expect)
+
+
+def test_chunk_pages_keep_the_byte_offset_inside_int32():
+    stride = 64 * 528
+    pages = _mod._chunk_pages(stride)
+    assert pages * stride <= 2**31 - 1
+    assert (pages + 1) * stride > 2**31 - 1
+
+
 def test_selected_byte_offsets_stay_int64_past_2gb():
     page = 100_000
     page_stride = 64 * 528

@@ -372,6 +372,38 @@ def _swiglu_clamp_limit(plan: dict, w: torch.nn.Module) -> float | None:
     return value if value > 0.0 else None
 
 
+def expert_row_scales(
+    weight_scale: torch.Tensor, expert_counts: torch.Tensor, rows: int
+) -> torch.Tensor:
+    """Repeat per-expert channel scales across ``rows`` without a host read.
+
+    Rows past ``sum(expert_counts)`` are zero. ``tolist`` / ``sum().item()``
+    would drain the NPU stream once per MoE layer to learn that sum.
+    """
+    if rows < 0:
+        raise ValueError(f"rows must be non-negative, got {rows}")
+    if expert_counts.ndim != 1:
+        raise ValueError(
+            f"expert_counts must be rank 1, got {tuple(expert_counts.shape)}"
+        )
+    if weight_scale.shape[0] != expert_counts.shape[0]:
+        raise ValueError(
+            "weight_scale rows must match expert_counts, "
+            f"got {weight_scale.shape[0]} and {expert_counts.shape[0]}"
+        )
+    channels = weight_scale.shape[-1]
+    if rows == 0 or expert_counts.numel() == 0:
+        return weight_scale.new_empty((rows, channels))
+    ends = expert_counts.to(dtype=torch.int64).cumsum(0)
+    starts = torch.cat((ends.new_zeros(1), ends[:-1]), dim=0)
+    row = torch.arange(rows, device=ends.device).unsqueeze(1)
+    inside = (row >= starts) & (row < ends)
+    expert = inside.to(dtype=torch.int64).argmax(dim=1)
+    valid = inside.any(dim=1)
+    scales = weight_scale.index_select(0, expert)
+    return scales * valid.to(dtype=scales.dtype).unsqueeze(1)
+
+
 def _expand_expert_scales(
     weight_scale: torch.Tensor, expert_counts: torch.Tensor
 ) -> torch.Tensor:
@@ -425,29 +457,47 @@ def _ascend_int8_dequant_swiglu_quant(
             "Ascend W8A8 MoE SwiGLU clamp does not combine with w2 smooth scales"
         )
     tokens = hidden_i32.shape[0]
-    total = int(expert_counts.to(torch.int64).sum().item())
-    if total > tokens:
-        raise ValueError(
-            "Ascend W8A8 MoE SwiGLU clamp expert counts exceed the token buffer"
-        )
     width = hidden_i32.shape[-1] // 2
-    if total == 0:
-        return (
-            hidden_i32.new_zeros((tokens, width), dtype=torch.int8),
-            hidden_i32.new_ones((tokens,), dtype=torch.float32),
-        )
-    # activation_scale may be [TokensNum] or [TokensNum, 1]; keep it rank-1 so
-    # unsqueeze(-1) stays a column broadcast against [total, channels].
-    act = activation_scale.float().reshape(-1)
-    if act.numel() < total:
-        raise ValueError(
-            "Ascend W8A8 MoE SwiGLU clamp activation scales are shorter than "
-            "the live expert rows"
-        )
-    row_scale = _expand_expert_scales(weight_scale.float(), expert_counts)
-    gate_up = (
-        hidden_i32[:total].float() * act[:total].unsqueeze(-1) * row_scale
-    ).to(dtype=torch.bfloat16)
+    # Host counts can still take the packed prefix. Device counts must not
+    # be read back: sum().item() drains the stream between the two grouped
+    # matmuls on every MoE layer.
+    if expert_counts.device.type == "cpu":
+        total = int(expert_counts.to(torch.int64).sum())
+        if total > tokens:
+            raise ValueError(
+                "Ascend W8A8 MoE SwiGLU clamp expert counts exceed the token buffer"
+            )
+        if total == 0:
+            return (
+                hidden_i32.new_zeros((tokens, width), dtype=torch.int8),
+                hidden_i32.new_ones((tokens,), dtype=torch.float32),
+            )
+        act = activation_scale.float().reshape(-1)
+        if act.numel() < total:
+            raise ValueError(
+                "Ascend W8A8 MoE SwiGLU clamp activation scales are shorter than "
+                "the live expert rows"
+            )
+        row_scale = _expand_expert_scales(weight_scale.float(), expert_counts)
+        hidden_live = hidden_i32[:total]
+        act_live = act[:total]
+    else:
+        if tokens == 0:
+            return (
+                hidden_i32.new_zeros((0, width), dtype=torch.int8),
+                hidden_i32.new_ones((0,), dtype=torch.float32),
+            )
+        act = activation_scale.float().reshape(-1)
+        if act.numel() < tokens:
+            act = torch.nn.functional.pad(act, (0, tokens - act.numel()))
+        else:
+            act = act[:tokens]
+        row_scale = expert_row_scales(weight_scale.float(), expert_counts, tokens)
+        hidden_live = hidden_i32
+        act_live = act
+    gate_up = (hidden_live.float() * act_live.unsqueeze(-1) * row_scale).to(
+        dtype=torch.bfloat16
+    )
     gate, up = gate_up.chunk(2, dim=-1)
     gate = gate.clamp_max(limit)
     up = up.clamp(-limit, limit)
@@ -455,8 +505,9 @@ def _ascend_int8_dequant_swiglu_quant(
     mid_q, mid_s = torch_npu.npu_dynamic_quant(mid)
     if mid_q.shape[0] == tokens:
         return mid_q, mid_s
-    # Match the fused op's output geometry: full capacity rows, live prefix
-    # filled, unused suffix left inert for the grouped down-projection.
+    # CPU packed prefix: restore the capacity-sized outputs the grouped
+    # down-projection indexes with expert_counts.
+    total = mid_q.shape[0]
     out_q = mid_q.new_zeros((tokens, mid_q.shape[-1]))
     out_s = mid_s.new_ones((tokens,))
     out_q[:total] = mid_q

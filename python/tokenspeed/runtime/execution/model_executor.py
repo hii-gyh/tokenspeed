@@ -956,6 +956,7 @@ class ModelExecutor:
             runtime_states=self.runtime_states,
             decode_graph_supported=self._graph_support.decode_graph,
         )
+        self.forward_step.replay_input_model = self.model_runner.model
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
         # The prefill role never decodes: a DECODE-shaped dummy would need the
         # verify scratch it does not allocate, and its ranks initialize lazy

@@ -175,6 +175,9 @@ class ForwardContext:
     # back to ``input_num_tokens`` / ``global_num_tokens``.
     collective_num_tokens: int | None = None
     collective_global_num_tokens: list[int] | None = None
+    # Wide-EP dispatch capacity for this forward, computed once from
+    # ``global_num_tokens`` before the layers run. ``(total, per-rank max)``.
+    wide_ep_bounds: tuple[int, int] | None = None
 
     # Set by models that explicitly select their logits rows.
     logits_rows_selected: bool = False
@@ -204,6 +207,11 @@ class ForwardContext:
     # forward or travels in PPStageState, never on ctx. A configured producer
     # owns context cache writes; otherwise the drafter owns them.
     dspark_context_producer: DSparkContextProducer | None = None
+
+    # Optional decode attribution probe (TOKENSPEED_LOG_LAYER_KIND_TIMING).
+    # Carries the active LayerKindTimer so decoder layers can mark attn/MLP
+    # sub-phases without process-global state.
+    layer_kind_timer: object | None = None
 
 
 @contextmanager

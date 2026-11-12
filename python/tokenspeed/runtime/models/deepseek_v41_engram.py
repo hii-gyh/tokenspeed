@@ -803,14 +803,15 @@ class RowShardedEngramEmbedding(nn.Module):
                 raise ValueError("Open Engram safetensors on CPU before slicing")
             self._copy_rows(param, rows, start - self.row_start)
 
-    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+    def forward(self, indices: torch.Tensor, *, out_device=None) -> torch.Tensor:
         """Gather [..., hash columns] IDs into BF16 [..., hash columns, head dim].
 
         All TP peers must pass identical indices. Shared host tables gather the
         full copy and skip the all-reduce. GPU and host-sharded tables expand
-        only local rows and reduce. Dequantization uses the same FP8/E8M0
-        torch casts in both paths.
+        only local rows and reduce. ``out_device`` is where the gathered rows
+        are returned; host INT8 tables gather on CPU and copy there once.
         """
+        target = indices.device if out_device is None else out_device
         if (
             indices.is_cuda
             and not self.host_table
@@ -837,10 +838,10 @@ class RowShardedEngramEmbedding(nn.Module):
             )
             codes = self.weight[table_ids]
             scales = self.scale[table_ids]
-            if codes.device != indices.device:
-                codes = codes.to(device=indices.device)
-                scales = scales.to(device=indices.device)
-                valid = valid.to(device=indices.device)
+            if codes.device != target:
+                codes = codes.to(device=target)
+                scales = scales.to(device=target)
+                valid = valid.to(device=target)
             values = _dequant_engram_rows(codes, scales, self.weight_dtype)
             values = values.masked_fill(~valid.unsqueeze(-1), 0)
         else:
@@ -883,6 +884,8 @@ class RowShardedEngramEmbedding(nn.Module):
                 backend=None,
                 op=torch.distributed.ReduceOp.SUM,
             ).view(values.shape)
+        if values.device != target:
+            values = values.to(device=target)
         return values
 
 
@@ -982,10 +985,18 @@ class DeepseekV41Engram(nn.Module):
         self.k_weight.weight_loader = default_weight_loader
         # Optional QuaRot undo for Ascend W8A8; bind_checkpoint_dir fills this.
         self.rotation_block: torch.Tensor | None = None
+        # Device copy of rotation_block. Moving the 32×32 block on every
+        # Engram layer synchronizes the step.
+        self._rotation_on_device: torch.Tensor | None = None
         # The embedding reduces [tokens, n_hash_cols * head_dim] across attention
         # TP; widen the one-shot lane to that width so decode batches take the
         # workspace kernel. Collective: every rank builds the same layers.
         self.reduce_lane_armed = False
+        # Filled for one forward by the model, before any layer runs.
+        # None means this call gathers itself.
+        self._prepared_values: torch.Tensor | None = None
+        # Stable storage a decode graph reads. Later steps copy into it.
+        self._value_buf: torch.Tensor | None = None
         if (
             len(mapping.attn.tp_group) > 1
             and host_layout != "shared"
@@ -1006,6 +1017,7 @@ class DeepseekV41Engram(nn.Module):
         """Install the 32×32 QuaRot block used to undo checkpoint rotation."""
         if block is None:
             self.rotation_block = None
+            self._rotation_on_device = None
             return
         if (
             block.ndim != 2
@@ -1017,6 +1029,50 @@ class DeepseekV41Engram(nn.Module):
                 f"got {tuple(block.shape)}"
             )
         self.rotation_block = block.detach().float().contiguous()
+        self._rotation_on_device = None
+
+    def _rotation_matrix(self, device: torch.device) -> torch.Tensor:
+        """QuaRot block on ``device``, copied at most once per placement."""
+        block = self.rotation_block
+        if block is None:
+            raise RuntimeError("Engram rotation block is not installed")
+        cached = self._rotation_on_device
+        if cached is not None and cached.device == device:
+            return cached
+        cached = block if block.device == device else block.to(
+            device=device, dtype=torch.float32
+        )
+        self._rotation_on_device = cached
+        return cached
+
+    def hold_prepared(self, fresh: torch.Tensor) -> None:
+        """Keep ``fresh`` in storage a later decode replay can overwrite.
+
+        The first call sizes the buffer to at least ``max_num_seqs`` so every
+        decode-graph batch fits. A larger eager prefill does not replace it.
+        """
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        rows = int(fresh.shape[0])
+        buf = self._value_buf
+        if (
+            buf is not None
+            and buf.shape[0] >= rows
+            and buf.shape[1:] == fresh.shape[1:]
+            and buf.dtype == fresh.dtype
+            and buf.device == fresh.device
+        ):
+            buf[:rows].copy_(fresh)
+            self._prepared_values = buf[:rows]
+            return
+        if buf is not None:
+            self._prepared_values = fresh
+            return
+        cap = max(rows, int(global_server_args_dict.get("max_num_seqs") or 0))
+        stored = fresh.new_empty((cap, *fresh.shape[1:]))
+        stored[:rows].copy_(fresh)
+        self._value_buf = stored
+        self._prepared_values = stored[:rows]
 
     def checkpoint_weight_aliases(self) -> dict[str, str]:
         """Return raw layers.<id>.engram checkpoint names to runtime param paths.
@@ -1063,7 +1119,11 @@ class DeepseekV41Engram(nn.Module):
             raise TypeError("Engram token mask must be bool")
         if hidden_states.numel() == 0:
             return hidden_states
-        embeddings = self.embed(hash_ids).flatten(-2)
+        if self._prepared_values is not None:
+            embeddings = self._prepared_values
+        else:
+            embeddings = self.embed(hash_ids, out_device=hidden_states.device)
+        embeddings = embeddings.flatten(-2)
         kv, _ = self.wkv(embeddings, block_scale=None, output_dtype=None)
         # Fused CUDA gate has no QuaRot undo; match vLLM and take the torch path
         # whenever the checkpoint declares a rotation block.
@@ -1078,7 +1138,7 @@ class DeepseekV41Engram(nn.Module):
         h = hidden_states.float()
         original = h
         if self.rotation_block is not None:
-            block = self.rotation_block.to(device=h.device, dtype=torch.float32)
+            block = self._rotation_matrix(h.device)
             original = (
                 original.unflatten(-1, (-1, block.shape[0])) @ block.T
             ).flatten(-2)
@@ -1087,7 +1147,10 @@ class DeepseekV41Engram(nn.Module):
             key.square().mean(-1) + self.eps
         )
         dot = (original * weight * key).sum(-1) * rstd * self.dim**-0.5
-        gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+        # NPU has no copysign kernel; the fallback copies both tensors to the host
+        # and aborts graph capture. A negative dot carries the sign.
+        magnitude = dot.abs().clamp_min(1e-6).sqrt()
+        gate = torch.sigmoid(torch.where(dot < 0, -magnitude, magnitude))
         gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
         return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(
             hidden_states.dtype

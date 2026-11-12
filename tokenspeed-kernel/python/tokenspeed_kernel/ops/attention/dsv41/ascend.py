@@ -44,6 +44,7 @@ from tokenspeed_kernel.ops.attention.dsv41.pages import (
     a2_cmp_topk,
     align_pa_block_for_a2,
     decode_cu_seqlens_q,
+    host_seqused_max,
     pad_sparse_indices,
     prefill_workspace_selections,
     repeat_query_heads,
@@ -63,26 +64,21 @@ if current_platform().is_npu:
     _FP32_SIG = frozenset({format_signature(x=dense_tensor_format(torch.float32))})
     _BYTE_SIG = frozenset({format_signature(x=dense_tensor_format(torch.uint8))})
     _BF16_SIG = frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))})
-    # The metadata kernel writes 1024 int32s. A one-card launch accepts that.
-    # The 1024-token SWA warmup on the cluster asks for 2048, so the caller
-    # retries with the longer buffer when tiling says so.
+    # The metadata kernel writes 1024 int32s. That buffer already holds the
+    # full per-core schedule (36 cube records of 9 and 72 vector records of 8).
+    # Zero-filling another length changes that stride.
     _SPARSE_MLA_METADATA_LEN = 1024
-    _SPARSE_MLA_METADATA_RETRY = 2048
     # The A2 example launches 64 query heads. TP ranks may hold fewer; the
     # vector tiles are 16-wide, so repeat up to the example width and slice back.
     _SPARSE_MLA_QUERY_HEADS = 64
 
-    def _metadata_buffer(metadata: torch.Tensor, length: int) -> torch.Tensor:
-        if metadata.ndim != 1 or metadata.shape[0] > length:
+    def _metadata_from_kernel(metadata: torch.Tensor) -> torch.Tensor:
+        if metadata.ndim != 1 or metadata.shape[0] != _SPARSE_MLA_METADATA_LEN:
             raise ValueError(
-                "SparseFlashMla metadata must be a vector of at most "
-                f"{length}, got {tuple(metadata.shape)}"
+                "SparseFlashMla metadata must be the kernel's "
+                f"{_SPARSE_MLA_METADATA_LEN}-int32 vector, got {tuple(metadata.shape)}"
             )
-        if metadata.shape[0] == length:
-            return metadata
-        padded = metadata.new_zeros(length)
-        padded[: metadata.shape[0]] = metadata
-        return padded
+        return metadata
 
     @register_kernel(
         "attention",
@@ -137,7 +133,7 @@ if current_platform().is_npu:
             seqused_cmp_kv=seqused_cmp_kv,
             cmp_residual_kv=cmp_residual_kv,
             sinks=sinks,
-            metadata=_metadata_buffer(metadata, _SPARSE_MLA_METADATA_LEN),
+            metadata=_metadata_from_kernel(metadata),
             softmax_scale=softmax_scale,
             cmp_ratio=cmp_ratio,
             ori_mask_mode=ori_mask_mode,
@@ -297,29 +293,13 @@ if current_platform().is_npu:
             # block already covers the sequence.
             if residual is None:
                 residual = torch.zeros(tokens, dtype=torch.int32, device=q.device)
-        ori_max = int(seqused_ori.max()) if seqused_ori.numel() else 0
-        cmp_max = int(seqused_cmp.max()) if seqused_cmp is not None and seqused_cmp.numel() else 0
-        print(
-            "[smla] "
-            f"tokens={tokens} live_heads={live_heads} heads={heads} "
-            f"has_cmp={has_cmp} cmp_ratio={0 if not has_cmp else int(cmp_ratio)} "
-            f"block_rows={block_rows} max_cmp={max_seqlen_cmp} cmp_topk={cmp_topk} "
-            f"win={win_left},{win_right} ori_max={ori_max} cmp_max={cmp_max}",
-            flush=True,
-        )
-        if ori_max <= 0 and cmp_max <= 0:
+        # Device .max() here is one stream drain per attention layer. Host
+        # lengths still skip an empty launch; device lengths launch.
+        ori_max = host_seqused_max(seqused_ori)
+        cmp_max = host_seqused_max(seqused_cmp)
+        if ori_max == 0 and cmp_max == 0:
             return q.new_zeros((tokens, live_heads, q.shape[-1]))
-
-        def _guard(fn):
-            try:
-                return fn()
-            except Exception:
-                import traceback
-
-                traceback.print_exc()
-                raise
-
-        metadata = _guard(lambda: npu_sparse_flash_mla_metadata(
+        metadata = npu_sparse_flash_mla_metadata(
             heads,
             1,
             q.shape[-1],
@@ -343,7 +323,8 @@ if current_platform().is_npu:
             ori_win_right=win_right,
             has_ori_kv=True,
             has_cmp_kv=has_cmp,
-        ))
+        )
+        metadata = _metadata_from_kernel(metadata)
         # Same ratio the metadata kernel just consumed. vLLM on this image
         # passes 0 without cmp_kv and the model ratio (1 or 2) with it.
         # Call the OPP wrapper directly so optional cmp tensors are not
@@ -375,16 +356,7 @@ if current_platform().is_npu:
             )
             return attended
 
-        try:
-            out = _guard(
-                lambda: _attend(_metadata_buffer(metadata, _SPARSE_MLA_METADATA_LEN))
-            )
-        except RuntimeError as exc:
-            if "must be2048" not in str(exc):
-                raise
-            out = _guard(
-                lambda: _attend(_metadata_buffer(metadata, _SPARSE_MLA_METADATA_RETRY))
-            )
+        out = _attend(metadata)
         return out[:, :live_heads]
 
     def swa_lens_as_seqused(topk_length: torch.Tensor) -> torch.Tensor:

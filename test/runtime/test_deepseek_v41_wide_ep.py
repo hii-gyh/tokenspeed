@@ -273,6 +273,20 @@ def test_gathered_slices_restore_and_one_token_pads():
     assert sent < sent * _ATTN_TP
 
 
+def test_rank_token_bounds_match_pad_and_split():
+    # Replicated full counts, not the post-split rows the dispatch sees.
+    full = [5] * _ATTN_TP + [0] * (_WORLD - _ATTN_TP)
+    locals_ = []
+    for count in full:
+        padded, _ = pad_token_dim(torch.zeros(count, 1), _ATTN_TP)
+        locals_.append(split_replicated_tokens(padded, 0, _ATTN_TP).shape[0])
+    assert _dispatch.wide_ep_bounds_from_rank_tokens(full, _ATTN_TP) == (
+        wide_ep_dispatch_bounds(locals_)
+    )
+    nine = [9] * _ATTN_TP + [0] * (_WORLD - _ATTN_TP)
+    assert _dispatch.wide_ep_bounds_from_rank_tokens(nine, _ATTN_TP) == (16, 2)
+
+
 def test_wide_ep_dispatch_bounds_agree_across_idle_groups():
     # One attention group holds a token. The other three are idle.
     counts = [1] * _ATTN_TP + [0] * (_WORLD - _ATTN_TP)

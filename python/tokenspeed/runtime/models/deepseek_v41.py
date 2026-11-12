@@ -174,6 +174,7 @@ from tokenspeed.runtime.models.deepseek_v41_wide_ep import (
     restore_gathered_tokens,
     split_replicated_tokens,
     unpad_token_dim,
+    wide_ep_bounds_from_rank_tokens,
     wide_ep_dispatch_bounds,
 )
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
@@ -204,10 +205,21 @@ def _wide_ep_token_bounds(local: int, device, mapping) -> tuple[int, int]:
 
     if not dist.is_initialized():
         return local, local
-    group = pg_manager.get_device_process_group(mapping.moe.ep_group)
+    ranks = mapping.moe.ep_group
+    group = pg_manager.get_device_process_group(ranks)
     world = dist.get_world_size(group)
     if world == 1:
         return local, local
+    # ``local`` is already a host int. An NPU all-gather followed by
+    # ``.tolist()`` drains the compute stream once per MoE layer.
+    if pg_manager.has_process_group("gloo", ranks):
+        gathered_counts: list[int | None] = [None] * world
+        dist.all_gather_object(
+            gathered_counts,
+            int(local),
+            group=pg_manager.get_process_group("gloo", ranks),
+        )
+        return wide_ep_dispatch_bounds([int(value) for value in gathered_counts])
     packed = torch.tensor([local], dtype=torch.int32, device=device)
     gathered = torch.empty(world, dtype=torch.int32, device=device)
     dist.all_gather_into_tensor(gathered, packed, group=group)
@@ -1818,9 +1830,12 @@ class DeepseekV41DecoderLayer(nn.Module):
                 image_mask = split_replicated_tokens(
                     image_mask, attn.tp_rank, attn.tp_size
                 )
-            total, maximum = _wide_ep_token_bounds(
-                x.shape[0], x.device, self.comm_manager.mapping
-            )
+            if ctx is not None and ctx.wide_ep_bounds is not None:
+                total, maximum = ctx.wide_ep_bounds
+            else:
+                total, maximum = _wide_ep_token_bounds(
+                    x.shape[0], x.device, self.comm_manager.mapping
+                )
             # Idle attention groups pass a 0-row tensor. The MoE joins the
             # same dispatch with one dummy row, because this op rejects batch 0.
             x = self.ffn(
@@ -2110,6 +2125,7 @@ class DeepseekV41Model(nn.Module):
         invocations are unsupported. The four stages below are the whole
         forward; the prefill graph calls them individually.
         """
+        self._bind_wide_ep_bounds(ctx)
         if input_ids.numel() == 0:
             if self.mapping.attn.has_dp:
                 hidden = self.embed_tokens.weight.new_empty(
@@ -2135,19 +2151,22 @@ class DeepseekV41Model(nn.Module):
             )
         backend = ctx.attn_backend
         backend.begin_indexer_forward()
-        state = self.encoder_forward(
-            input_ids,
-            positions,
-            ctx,
-            input_embeds,
-            pp_inbound,
-            engram_hash_ids=engram_hash_ids,
-            engram_token_mask=engram_token_mask,
-            image_mask=image_mask,
-        )
-        state = self.narrowing_forward(state, ctx)
-        hidden, captured = self.decoder_forward(state, ctx)
-        output = self.finish_forward(hidden, captured, ctx)
+        try:
+            state = self.encoder_forward(
+                input_ids,
+                positions,
+                ctx,
+                input_embeds,
+                pp_inbound,
+                engram_hash_ids=engram_hash_ids,
+                engram_token_mask=engram_token_mask,
+                image_mask=image_mask,
+            )
+            state = self.narrowing_forward(state, ctx)
+            hidden, captured = self.decoder_forward(state, ctx)
+            output = self.finish_forward(hidden, captured, ctx)
+        finally:
+            self._clear_staged_engram()
         backend.end_indexer_forward()
         return output
 
@@ -2191,6 +2210,56 @@ class DeepseekV41Model(nn.Module):
             captured.append(tap)
         return hidden, pre_mix, pending_post
 
+    def _bind_wide_ep_bounds(self, ctx: ForwardContext) -> None:
+        """One dispatch capacity for every wide-EP layer in this forward.
+
+        The scheduler gathered ``global_num_tokens`` before the model runs.
+        Narrowed decoder layers reuse that capacity instead of all-gathering
+        again inside the layer.
+        """
+        ctx.wide_ep_bounds = None
+        if not self.layers:
+            return
+        mapping = self.layers[0].comm_manager.mapping
+        if not mapping_uses_wide_ep(mapping) or ctx.global_num_tokens is None:
+            return
+        ctx.wide_ep_bounds = wide_ep_bounds_from_rank_tokens(
+            [ctx.global_num_tokens[rank] for rank in mapping.moe.ep_group],
+            mapping.attn.tp_size,
+        )
+
+    def _stage_engram(self, hashes: torch.Tensor | None, layers) -> None:
+        """Gather this stage's Engram rows into each layer's fixed buffer.
+
+        Host INT8 tables cannot be indexed on the NPU. The gather runs before
+        the stage, and decode-graph replay refreshes the same storage before
+        ``graph.replay``. Capture itself only reads that storage.
+        """
+        from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
+
+        if hashes is None or get_is_capture_mode():
+            return
+        device = self.embed_tokens.weight.device
+        cpu_hashes = hashes.detach()
+        if cpu_hashes.device.type != "cpu":
+            cpu_hashes = cpu_hashes.to(device="cpu")
+        for layer in layers:
+            engram = layer.engram
+            if engram is None:
+                continue
+            fresh = engram.embed(
+                cpu_hashes[:, engram.layer_hash_index],
+                out_device=device,
+            )
+            engram.hold_prepared(fresh)
+
+    def prepare_engram_buffers(self, hashes: torch.Tensor | None) -> None:
+        """Fill every Engram layer from this step's hash ids."""
+        self._stage_engram(hashes, self.layers)
+
+    def _clear_staged_engram(self) -> None:
+        return
+
     def encoder_forward(
         self,
         input_ids: torch.Tensor,
@@ -2231,6 +2300,7 @@ class DeepseekV41Model(nn.Module):
                 raise ValueError(
                     "Engram prepared hashes/mask have the wrong shape or dtype"
                 )
+        self._stage_engram(hashes, self.layers[: self.ced_decoder_start])
         h = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         _sync_fence("after_token_embed")
         if h.shape != (input_ids.numel(), self.config.hidden_size):
@@ -2296,6 +2366,7 @@ class DeepseekV41Model(nn.Module):
                 "narrowed row counts exchanged across ranks"
             )
         captured = list(state.captured)
+        self._stage_engram(state.hashes, self.layers[start : start + 1])
         # Fused EP exchanges actual local row counts inside its dispatch. The
         # original DP counts remain valid capacity bounds after CED narrowing;
         # no host exchange is needed for its routed or rank-local shared experts.
@@ -2353,6 +2424,7 @@ class DeepseekV41Model(nn.Module):
             )
             return hidden, captured
         ctx.attn_backend.begin_indexer_stage()
+        self._stage_engram(state.hashes, self.layers[start + 1 :])
         pending_post = None
         layers = self.layers[start + 1 :]
         if layers:

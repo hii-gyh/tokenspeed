@@ -106,6 +106,34 @@ def ced_narrowing_needs_row_exchange(
     )
 
 
+def wide_ep_local_rows(full: int, tp_size: int) -> int:
+    """Rows one attention rank sends after padding and striding a replicated batch.
+
+    ``full`` is that rank's token count before the split. Padding matches
+    ``pad_token_dim``; the stride matches ``split_replicated_tokens``.
+    """
+    if tp_size < 1:
+        raise ValueError(f"tp_size must be positive, got {tp_size}")
+    if full < 0:
+        raise ValueError(f"token count must be non-negative, got {full}")
+    pad = (-full) % tp_size
+    return (full + pad) // tp_size
+
+
+def wide_ep_bounds_from_rank_tokens(
+    rank_tokens: list[int], tp_size: int
+) -> tuple[int, int]:
+    """Dispatch sum and per-rank maximum from the scheduler's per-rank counts.
+
+    Those counts are gathered on the host before the model forward. Deriving
+    the post-split rows here keeps the MoE launch from all-gathering again
+    inside every layer.
+    """
+    return wide_ep_dispatch_bounds(
+        [wide_ep_local_rows(int(full), tp_size) for full in rank_tokens]
+    )
+
+
 def wide_ep_dispatch_bounds(local_counts: list[int]) -> tuple[int, int]:
     """Return the token sum and the per-rank maximum for one expert group.
 

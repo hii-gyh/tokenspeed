@@ -243,3 +243,14 @@ def test_prefill_workspace_matches_the_dense_key_set():
     )
     assert no_cmp is None and no_residual is None
     assert swa_only.topk_length.view(-1).tolist() == [2, 1]
+
+
+def test_host_seqused_max_does_not_read_device_tensors():
+    assert _pages.host_seqused_max(None) == 0
+    assert _pages.host_seqused_max(torch.empty(0, dtype=torch.int32)) == 0
+    lengths = torch.tensor([0, 4, 2], dtype=torch.int32)
+    assert _pages.host_seqused_max(lengths) == 4
+    assert _pages.host_seqused_max(torch.zeros(3, dtype=torch.int32)) == 0
+    # A non-CPU tensor must not be reduced. meta is enough to prove the branch.
+    meta = torch.empty(3, dtype=torch.int32, device="meta")
+    assert _pages.host_seqused_max(meta) is None

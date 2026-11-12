@@ -45,6 +45,20 @@ SWA_WINDOW = 128
 HEAD_DIM = 512
 
 
+def host_seqused_max(lengths: torch.Tensor | None) -> int | None:
+    """Return a host-side max, or None when the tensor lives on a device.
+
+    ``int(lengths.max())`` on an NPU tensor drains the compute stream. Sparse
+    MLA calls this once per layer, so a device reduction is not a usable
+    empty-batch check. ``None`` means the caller should launch.
+    """
+    if lengths is None or lengths.numel() == 0:
+        return 0
+    if lengths.device.type != "cpu":
+        return None
+    return int(lengths.detach().max())
+
+
 class PaBbndSelection(NamedTuple):
     """One PA_BBND cache view plus the tables/indices that address it."""
 

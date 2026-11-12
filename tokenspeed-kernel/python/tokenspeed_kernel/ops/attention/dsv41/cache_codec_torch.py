@@ -37,7 +37,25 @@ _LAYOUTS = {
     "index": (128, 32, 64, 68),
 }
 _E2M1_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1_ORDER = (0, 2, 4, 6, 1, 3, 5, 7)
+# E4M3FN NaN encodings are 0x7F and 0xFF. The finite codes are a constant.
+_E4M3_FINITE = tuple(code for code in range(256) if (code & 0x7F) != 0x7F)
 _PAGE_ROWS = 64
+_DEVICE_CONSTS: dict[tuple[str, str], torch.Tensor] = {}
+
+
+def _device_const(name: str, device: torch.device, build) -> torch.Tensor:
+    """Reuse a tiny device tensor built on the first call.
+
+    Graph capture cannot boolean-index or copy these tables from the host.
+    Warmup builds them; capture and replay read the same storage.
+    """
+    key = (name, str(device))
+    found = _DEVICE_CONSTS.get(key)
+    if found is None:
+        found = build(device)
+        _DEVICE_CONSTS[key] = found
+    return found
 
 
 def _layout(cache_format: str):
@@ -66,14 +84,26 @@ def _flat_pages(cache: torch.Tensor, row_bytes: int) -> torch.Tensor:
 
 
 def _e2m1_decode(nibbles: torch.Tensor) -> torch.Tensor:
-    levels = torch.tensor(_E2M1_LEVELS, device=nibbles.device, dtype=torch.float32)
+    levels = _device_const(
+        "e2m1_levels",
+        nibbles.device,
+        lambda device: torch.tensor(_E2M1_LEVELS, device=device, dtype=torch.float32),
+    )
     mag = levels[(nibbles & 7).long()]
     return torch.where((nibbles & 8) != 0, -mag, mag)
 
 
 def _e2m1_encode(values: torch.Tensor) -> torch.Tensor:
-    levels = torch.tensor(_E2M1_LEVELS, device=values.device, dtype=torch.float32)
-    order = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7], device=values.device)
+    levels = _device_const(
+        "e2m1_levels",
+        values.device,
+        lambda device: torch.tensor(_E2M1_LEVELS, device=device, dtype=torch.float32),
+    )
+    order = _device_const(
+        "e2m1_order",
+        values.device,
+        lambda device: torch.tensor(_E2M1_ORDER, device=device),
+    )
     distance = (values.abs().unsqueeze(-1) - levels[order]).abs()
     code = order[distance.argmin(dim=-1)]
     negative = torch.signbit(values)
@@ -98,16 +128,31 @@ def _e4m3_to_float(codes: torch.Tensor) -> torch.Tensor:
     return torch.where(sign == 1, -value, value)
 
 
+def _e4m3_finite(device: torch.device) -> torch.Tensor:
+    return _device_const(
+        "e4m3_finite",
+        device,
+        lambda dev: torch.tensor(_E4M3_FINITE, dtype=torch.int32, device=dev),
+    )
+
+
 def _float_to_e4m3(values: torch.Tensor) -> torch.Tensor:
     """Encode finite floats as E4M3FN bytes. CUDA uses the float8 cast."""
     if values.is_cuda:
         return values.to(torch.float8_e4m3fn).view(torch.uint8)
-    finite = torch.arange(256, device=values.device, dtype=torch.int32)
-    finite = finite[(finite & 0x7F) != 0x7F]
-    table = _e4m3_to_float(finite.to(torch.uint8))
+    finite = _e4m3_finite(values.device)
+    table = _device_const(
+        "e4m3_table",
+        values.device,
+        lambda device: _e4m3_to_float(_e4m3_finite(device).to(torch.uint8)),
+    )
+    odd = _device_const(
+        "e4m3_odd",
+        values.device,
+        lambda device: ((_e4m3_finite(device) & 1) != 0).to(torch.float32),
+    )
     distance = (values.float().unsqueeze(-1) - table).abs()
     # Exact midpoints round to the even trailing mantissa bit, matching torch.
-    odd = ((finite & 1) != 0).to(torch.float32)
     nearest = (distance + odd * 1e-6).argmin(dim=-1)
     return finite[nearest].to(torch.uint8)
 
@@ -120,7 +165,7 @@ def _pack_rows(rows: torch.Tensor, cache_format: str) -> torch.Tensor:
     if cache_format == "global":
         scale = _float_to_e4m3(amax.clamp_min(6 * 2.0**-9) / 6)
         scale_bytes = scale if scale.dtype == torch.uint8 else scale.view(torch.uint8)
-        scale_f = scale.float()
+        scale_f = _e4m3_to_float(scale_bytes)
     else:
         swa = cache_format == "swa"
         scaled = amax.clamp_min(1e-4 if swa else 6 * 2.0**-126)
@@ -186,6 +231,49 @@ def _column_indexes(slots: torch.Tensor, width: int, origin: int) -> torch.Tenso
     )
 
 
+def _chunk_pages(page_stride: int) -> int:
+    """Pages addressed inside one signed 32-bit byte offset.
+
+    A real KV pool passes 2 GiB. Indexing ``page * stride + col`` across that
+    pool is rejected. A slice of this many pages keeps the in-slice offset
+    inside int32; the slice base itself is a Python integer.
+    """
+    stride = max(int(page_stride), 1)
+    return max(1, (2**31 - 1) // stride)
+
+
+def _winning_values(
+    key: torch.Tensor, active: torch.Tensor, values: torch.Tensor
+) -> torch.Tensor:
+    """Repeat the last active row's values across rows that share ``key``.
+
+    The index write stores that one payload at every duplicate, so the stored
+    bytes do not depend on which duplicate a device applies last.
+    """
+    count = key.shape[0]
+    if count <= 1:
+        return values
+    priority = torch.where(
+        active,
+        torch.arange(count, device=key.device),
+        torch.full((count,), -1, device=key.device),
+    )
+    order = torch.argsort(
+        key.to(torch.int64) * (count + 1) + (priority.to(torch.int64) + 1)
+    )
+    grouped = key.to(torch.int64)[order]
+    is_end = torch.ones(count, dtype=torch.bool, device=key.device)
+    is_end[:-1] = grouped[:-1] != grouped[1:]
+    position = torch.arange(count, device=key.device)
+    nearest_end = torch.cummin(
+        torch.where(is_end, position, torch.full_like(position, count)).flip(0),
+        dim=0,
+    ).values.flip(0)
+    inverse = torch.empty_like(order)
+    inverse[order] = position
+    return values[order[nearest_end[inverse]]]
+
+
 def _transfer_selected(
     flat: torch.Tensor,
     slots: torch.Tensor,
@@ -193,26 +281,44 @@ def _transfer_selected(
     packed_cols: torch.Tensor,
     *,
     write: bool,
+    live: torch.Tensor | None = None,
 ) -> None:
-    """Copy selected columns one page at a time.
+    """Copy selected columns in fixed page chunks.
 
-    Indexing ``page * stride + col`` into the whole pool passes 2^31 bytes on
-    a real KV arena. NPU's index check then rejects the coordinate. Each page
-    is only ``flat.shape[1]`` bytes, so the index stays inside that page.
+    The chunk count comes from the pool shape, not from the slot values, so a
+    captured replay still follows the slot tensor. ``live`` rows outside a
+    chunk put the bytes they read back; inactive rows therefore do not need a
+    host-side mask.
     """
     if slots.numel() == 0:
         return
     page = torch.div(slots, _PAGE_ROWS, rounding_mode="floor")
-    for page_id in page.unique().tolist():
-        chosen = page == page_id
-        row = flat[int(page_id)]
-        if write:
-            row[cols[chosen]] = packed_cols[chosen]
+    page_row = torch.remainder(slots, _PAGE_ROWS)
+    page_stride = int(flat.stride(0))
+    chunk_pages = _chunk_pages(page_stride)
+    for start in range(0, flat.shape[0], chunk_pages):
+        stop = min(start + chunk_pages, flat.shape[0])
+        view = flat[start:stop]
+        in_chunk = (page >= start) & (page < stop)
+        if live is not None:
+            in_chunk = live & in_chunk
+        local = (page - start).clamp(0, stop - start - 1)
+        taken = view[local.unsqueeze(1), cols]
+        if not write:
+            packed_cols.copy_(torch.where(in_chunk.unsqueeze(1), taken, packed_cols))
             continue
-        packed_cols[chosen] = row[cols[chosen]]
+        payload = torch.where(in_chunk.unsqueeze(1), packed_cols, taken)
+        key = local.to(torch.int64) * _PAGE_ROWS + page_row.to(torch.int64)
+        view[local.unsqueeze(1), cols] = _winning_values(key, in_chunk, payload)
 
 
-def _write_planar(cache: torch.Tensor, slots: torch.Tensor, packed: torch.Tensor, cache_format: str) -> None:
+def _write_planar(
+    cache: torch.Tensor,
+    slots: torch.Tensor,
+    packed: torch.Tensor,
+    cache_format: str,
+    live: torch.Tensor,
+) -> None:
     _, _, value_bytes, row_bytes = _layout(cache_format)
     scale_bytes = row_bytes - value_bytes
     flat = _flat_pages(cache, row_bytes)
@@ -222,6 +328,7 @@ def _write_planar(cache: torch.Tensor, slots: torch.Tensor, packed: torch.Tensor
         _column_indexes(slots, value_bytes, 0),
         packed[:, :value_bytes],
         write=True,
+        live=live,
     )
     _transfer_selected(
         flat,
@@ -229,6 +336,7 @@ def _write_planar(cache: torch.Tensor, slots: torch.Tensor, packed: torch.Tensor
         _column_indexes(slots, scale_bytes, _PAGE_ROWS * value_bytes),
         packed[:, value_bytes:],
         write=True,
+        live=live,
     )
 
 
@@ -298,12 +406,12 @@ def cache_scatter_torch(
         raise ValueError(f"rows must be BF16/FP32 [N, {dim}]")
     if slots.shape != (rows.shape[0],) or slots.dtype not in (torch.int32, torch.int64):
         raise ValueError("slots must be integer [N]")
+    if rows.shape[0] == 0:
+        return
     capacity = cache.shape[0] * _PAGE_ROWS
     live = (slots >= 0) & (slots < capacity)
-    if not bool(live.any()):
-        return
-    packed = _pack_rows(rows[live], cache_format)
-    _write_planar(cache, slots[live], packed, cache_format)
+    packed = _pack_rows(rows, cache_format)
+    _write_planar(cache, slots, packed, cache_format, live)
 
 
 def cache_unpack_torch(
