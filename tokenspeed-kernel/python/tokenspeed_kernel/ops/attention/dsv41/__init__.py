@@ -1215,8 +1215,10 @@ def dspark_block(
         device = bonus.device
         ids = torch.full((n, block_size), noise_token, dtype=torch.int32, device=device)
         ids[:, 0] = bonus
-        positions = start_pos.to(torch.int64)[:, None] + 1 + torch.arange(
-            block_size, device=device
+        positions = (
+            start_pos.to(torch.int64)[:, None]
+            + 1
+            + torch.arange(block_size, device=device)
         )
         pre_mix = torch.zeros(
             (n * block_size, hc_mult), dtype=torch.float32, device=device
@@ -1584,18 +1586,21 @@ def history_pack(cache, table, visible_rows, *, virtual_block_count, degree, ran
     )
 
 
-# Backend registration (side-effect imports)
+# Backend registration (side-effect imports).
+# NPU only needs the Ascend solution; importing Triton/Gluon/DeepGEMM here
+# pulls CUDA/AMD-only modules (warmup, host gather extras) that the Ascend
+# deploy tree does not ship and stalls serve before any forward runs.
 # isort: off
-import tokenspeed_kernel.ops.attention.dsv41.triton  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.dsv41._triton.rope  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.dsv41._triton.kvp  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.dsv41.gluon  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.dsv41.deep_select  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.dsv41.deep_gemm  # noqa: E402,F401
-import tokenspeed_kernel.ops.attention.dsv41.flash_mla  # noqa: E402,F401
-
 if current_platform().is_npu:
     import tokenspeed_kernel.ops.attention.dsv41.ascend  # noqa: E402,F401
+else:
+    import tokenspeed_kernel.ops.attention.dsv41.triton  # noqa: E402,F401
+    import tokenspeed_kernel.ops.attention.dsv41._triton.rope  # noqa: E402,F401
+    import tokenspeed_kernel.ops.attention.dsv41._triton.kvp  # noqa: E402,F401
+    import tokenspeed_kernel.ops.attention.dsv41.gluon  # noqa: E402,F401
+    import tokenspeed_kernel.ops.attention.dsv41.deep_select  # noqa: E402,F401
+    import tokenspeed_kernel.ops.attention.dsv41.deep_gemm  # noqa: E402,F401
+    import tokenspeed_kernel.ops.attention.dsv41.flash_mla  # noqa: E402,F401
 
 # isort: on
 

@@ -250,6 +250,28 @@ class HostProcess:
             self._popen.kill()
 
 
+@functools.lru_cache(maxsize=8)
+def _ts_host_supports_async_logging(binary: str) -> bool:
+    """True when ``binary`` accepts ``--enable-async-logging``.
+
+    Deploy trees may keep an older ``tokenspeed-engine`` wheel whose
+    ``ts-host`` only takes ``--python`` and ``--control-fd``. Probing
+    ``--help`` once per binary keeps those boots working until the wheel
+    is upgraded.
+    """
+    try:
+        completed = subprocess.run(
+            [binary, "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "--enable-async-logging" in (completed.stdout + completed.stderr)
+
+
 def start_rust_host(
     binary: str,
     server_args: ServerArgs,
@@ -288,21 +310,33 @@ def start_rust_host(
     preexec_fn = None
     if parent_death_signal:
         preexec_fn = functools.partial(set_parent_death_signal, os.getpid())
-    with start_context:
-        popen = subprocess.Popen(
+    argv = [
+        (
+            f"tokenspeed::encode_tp{server_args.mapping.attn.tp_rank}"
+            if server_args.disaggregation_mode == "encode"
+            else rank_process_title(server_args.mapping)
+        ),
+        "--python",
+        sys.executable,
+        "--control-fd",
+        str(child.fileno()),
+    ]
+    # Newer ts-host requires --enable-async-logging; older wheels reject it.
+    if _ts_host_supports_async_logging(binary):
+        argv.extend(
             [
-                (
-                    f"tokenspeed::encode_tp{server_args.mapping.attn.tp_rank}"
-                    if server_args.disaggregation_mode == "encode"
-                    else rank_process_title(server_args.mapping)
-                ),
-                "--python",
-                sys.executable,
-                "--control-fd",
-                str(child.fileno()),
                 "--enable-async-logging",
                 str(server_args.enable_async_logging).lower(),
-            ],
+            ]
+        )
+    elif server_args.enable_async_logging:
+        raise RuntimeError(
+            f"{binary} does not support --enable-async-logging; "
+            "upgrade tokenspeed-engine or disable --enable-async-logging"
+        )
+    with start_context:
+        popen = subprocess.Popen(
+            argv,
             executable=binary,
             pass_fds=[child.fileno(), held_until_exit],
             preexec_fn=preexec_fn,

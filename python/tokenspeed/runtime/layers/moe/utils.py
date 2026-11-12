@@ -46,6 +46,9 @@ class RoutingMethodType(IntEnum):
 class All2AllBackend(Enum):
 
     NONE = "none"
+    # Ascend wide-EP keeps the stock HCCL path; the CLI name is retained so
+    # existing DP4 entry scripts keep working after merging main's choices.
+    ASCEND = "ascend"
     AGRS = "agrs"
     DEEPEP = "deepep"
     FLASHINFER = "flashinfer"
@@ -61,7 +64,7 @@ class All2AllBackend(Enum):
         raise ValueError(f"No {cls.__name__} member for value {value}")
 
     def is_none(self):
-        return self == All2AllBackend.NONE
+        return self in (All2AllBackend.NONE, All2AllBackend.ASCEND)
 
     def is_deepep(self):
         return self == All2AllBackend.DEEPEP

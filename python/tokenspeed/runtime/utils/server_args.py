@@ -3019,6 +3019,8 @@ class ServerArgs:
                 "nvfp4",
                 "w8a8_fp8",
                 "compressed-tensors",
+                # Ascend modelslim W8A8; registered as AscendQuantConfig.
+                "ascend",
             ],
             help="The quantization method.",
         )
@@ -3689,10 +3691,18 @@ class ServerArgs:
             metavar="ALL2ALL_BACKEND",
             type=str,
             default=ServerArgs.all2all_backend,
-            choices=["none", "agrs", "deepep", "flashinfer", "gluon_petit"],
+            choices=[
+                "none",
+                "ascend",
+                "agrs",
+                "deepep",
+                "flashinfer",
+                "gluon_petit",
+            ],
             help="MoE communication backend. agrs and flashinfer explicitly select "
             "the Kimi-K3 attention-DP transport; gluon_petit selects the fused "
-            "Petit MegaMoE transport; none preserves existing behavior.",
+            "Petit MegaMoE transport; ascend is the Ascend wide-EP HCCL path "
+            "(same as none for dispatch selection); none preserves existing behavior.",
         )
         parser.add_argument(
             "--deepep-mode",

@@ -40,6 +40,15 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 
 
+def token_ids_int32(tokens) -> np.ndarray:
+    """Normalize scheduler token ids to a flat int32 ndarray.
+
+    Current bindings return a read-only numpy view; older embedded ts-host
+    schedulers still expose ``list[int]``.
+    """
+    return np.asarray(tokens, dtype=np.int32).reshape(-1)
+
+
 logger = get_colorful_logger(__name__)
 
 
@@ -553,13 +562,12 @@ class InputBuffers:
         # Determine input_ids and forward_mode
         if num_extends > 0:
             prefill_token_count = sum(input_lengths[:num_extends])
-            input_ids = forward_op.input_ids
-            shifted_ids = forward_op.shifted_input_ids
+            input_ids = token_ids_int32(forward_op.input_ids)
+            shifted_ids = token_ids_int32(forward_op.shifted_input_ids)
             input_ids_cpu, shifted_ids_cpu = self._bulk_pinned(
                 (input_ids.size, torch.int32), (shifted_ids.size, torch.int32)
             )
-            # Copy the scheduler's read-only int32 views directly into this
-            # step's writable pinned storage; no intermediate token copy.
+            # Copy into this step's writable pinned storage.
             np.copyto(input_ids_cpu.numpy(), input_ids, casting="no")
             np.copyto(shifted_ids_cpu.numpy(), shifted_ids, casting="no")
             self.input_ids_buf[:prefill_token_count].copy_(
