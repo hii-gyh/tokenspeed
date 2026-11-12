@@ -30,7 +30,7 @@ call and answers the model's ``forward``. Three kinds of node implement it:
 * composites that wrap a router next to a state consumer (hybrid GDN/KDA,
   Inkling's conv columns, MSA's sparse layers);
 * block consumers that read raw tables of their own state groups (Mamba /
-  KDA state paging, DeepSeek-V4's bespoke multi-group backend).
+  KDA state paging, DeepSeek V4.1's bespoke multi-group backend).
 
 ``block_tables`` is always a complete mapping — the runner synthesizes
 placeholder tables for capture, idle and warmup — so no implementation
@@ -78,6 +78,21 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.pd.utils import StepCounter
+
+
+@dataclass(frozen=True)
+class DecodeKVView:
+    """The paged cache and decode metadata one layer's decode attention reads.
+
+    For a kernel that runs this layer's decode attention inside a larger
+    launch instead of through the backend's ``forward``.
+    """
+
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    page_table: torch.Tensor
+    seq_lens: torch.Tensor
+    max_seqlen_k: int
 
 
 @dataclass
@@ -151,10 +166,25 @@ class CachePoolBinding:
         """Return logical-slot ownership, or None for local/replicated storage."""
         return None
 
+    def decode_kv_view(
+        self, layer: PagedAttention, token_to_kv_pool
+    ) -> DecodeKVView | None:
+        """``layer``'s decode cache view (:class:`DecodeKVView`), or None when
+        this backend's decode needs more than the cache and metadata (block
+        or per-tensor scales, a split schedule, another kernel family)."""
+        return None
+
     def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
         """Whether ``layer``'s reads apply the per-tensor scales its FP8 cache
         was written at (``PagedAttention.fp8_kv_scales``)."""
         return False
+
+    def query_dtype(
+        self, layer: PagedAttention, forward_mode: ForwardMode, activation: torch.dtype
+    ) -> torch.dtype:
+        """The dtype ``layer``'s attention reads its query in this forward,
+        which the GQA prologue returns it in so no separate cast runs."""
+        return activation
 
     # ------------------------------------------------------------------
     # Slot-state image (SlotStateExporter)
@@ -385,7 +415,8 @@ class AttentionBackend(CachePoolBinding, ABC):
         ``capture`` only retains startup buffers at their captured addresses;
         it must not select different computation. Returns the same answer as
         :meth:`admits_prefill_graph`, except that a forward writing in-forward
-        State checkpoints keeps its live metadata and gets False; the prefill
+        State checkpoints keeps its live metadata and gets False from a
+        backend whose fixed-capacity metadata stores none; the prefill
         capture raises if an override refuses a shape that query admitted.
         Other backends keep
         their existing metadata and attention breaks. Call on the consumer
