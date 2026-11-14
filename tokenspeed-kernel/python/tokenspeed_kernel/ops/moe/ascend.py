@@ -21,6 +21,10 @@
 """Ascend MoE kernel registrations."""
 
 import torch
+from tokenspeed_kernel.ops.moe.ascend_contract import (
+    distributed_bf16_apply_traits,
+    distributed_int8_apply_traits,
+)
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -34,6 +38,9 @@ if current_platform().is_npu:
     )
     from tokenspeed_kernel_npu.ops.moe import (
         ascend_bf16_process_moe_weights as _process_weights,
+    )
+    from tokenspeed_kernel_npu.ops.moe import (
+        ascend_int8_distributed_precomputed_moe_apply as _int8_distributed_moe_apply,
     )
     from tokenspeed_kernel_npu.ops.moe import (
         ascend_int8_precomputed_moe_apply as _int8_moe_apply,
@@ -110,6 +117,8 @@ if current_platform().is_npu:
             "ispp_alignment": frozenset({32}),
             "internal_activation_dtype": frozenset({"int8"}),
             "supports_bias": frozenset({False}),
+            "swiglu_form": frozenset({"standard"}),
+            "activation_clamped": frozenset({False, True}),
         },
         priority=Priority.SPECIALIZED,
         features={"ascend", "npu_graph", "w8a8", "nz"},
@@ -150,23 +159,28 @@ if current_platform().is_npu:
         solution="torch_npu",
         capability=_CAPABILITY,
         signatures=format_signatures("x", "dense", {torch.bfloat16}),
-        traits={
-            "weight_dtype": frozenset({"unquant"}),
-            "activation": frozenset({"silu", "swiglu"}),
-            "routing_mode": frozenset({"precomputed_topk"}),
-            "supports_deferred_finalize": frozenset({False}),
-            "supports_ep": frozenset({True}),
-            "supports_all_to_all_ep": frozenset({True}),
-            "ispp_alignment": frozenset({32}),
-            "internal_activation_dtype": frozenset({"input"}),
-            "supports_bias": frozenset({False}),
-        },
+        traits=distributed_bf16_apply_traits(),
         priority=Priority.SPECIALIZED,
         features={"ascend", "npu_graph", "all_to_all"},
         weight_preprocessor=_process_weights,
     )
     def distributed_moe_apply(**kwargs):
         return _distributed_moe_apply(**kwargs)
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="ascend_int8_distributed_precomputed_moe_apply",
+        solution="torch_npu",
+        capability=_CAPABILITY,
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits=distributed_int8_apply_traits(),
+        priority=Priority.SPECIALIZED,
+        features={"ascend", "npu_graph", "all_to_all", "w8a8", "nz"},
+        weight_preprocessor=_int8_process_weights,
+    )
+    def int8_distributed_moe_apply(**kwargs):
+        return _int8_distributed_moe_apply(**kwargs)
 
 
 __all__ = ["moe_apply", "softmax_bias_topk"]

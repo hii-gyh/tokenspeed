@@ -48,6 +48,9 @@ from tokenspeed.runtime.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from tokenspeed.runtime.layers.quantization.ascend_format import (
+    weights_index_filename,
+)
 from tokenspeed.runtime.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
@@ -316,6 +319,11 @@ class DefaultModelLoader(BaseModelLoader):
             )
         else:
             hf_folder = model_name_or_path
+
+        ascend_index = weights_index_filename(hf_folder)
+        if ascend_index is not None:
+            index_file = ascend_index
+            use_safetensors = True
 
         hf_weights_files: list[str] = []
         for pattern in allow_patterns:

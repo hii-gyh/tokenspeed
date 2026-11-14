@@ -418,6 +418,10 @@ class DeepseekV41Recipe(CacheRecipe):
             kvp_history = history_rows * (
                 4 * max(rows.global_row_bytes, rows.index_row_bytes) + 64
             )
+        # Eager Ascend attention issues one aclnnBatchMatMul of 4.61 GiB during
+        # batch-1 decode warmup, after the pool is already resident. Leave a
+        # 5 GiB hole so that workspace fits in the unpooled remainder.
+        ascend_attention = 5 * (1 << 30) if self.attn_config.device == "npu" else 0
         return (
             kvp_history
             + metadata
@@ -429,4 +433,5 @@ class DeepseekV41Recipe(CacheRecipe):
             + compact_metadata
             + index_queries
             + index_selection
+            + ascend_attention
         )

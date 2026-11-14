@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os
 from itertools import accumulate
 from typing import TYPE_CHECKING
 
@@ -39,7 +40,30 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 
 
+def token_ids_int32(tokens) -> np.ndarray:
+    """Normalize scheduler token ids to a flat int32 ndarray.
+
+    Current bindings return a read-only numpy view; older embedded ts-host
+    schedulers still expose ``list[int]``.
+    """
+    return np.asarray(tokens, dtype=np.int32).reshape(-1)
+
+
 logger = get_colorful_logger(__name__)
+
+
+def _sync_fence(name: str) -> None:
+    """Synchronize when TOKENSPEED_SYNC_FENCES=1 so the failing op is named.
+
+    A later copy otherwise reports an earlier kernel's ACL error.
+    """
+    if os.getenv("TOKENSPEED_SYNC_FENCES") != "1":
+        return
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.synchronize()
+    elif torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"[fence] {name}", flush=True)
 
 
 class InputBuffers:
@@ -333,6 +357,7 @@ class InputBuffers:
             self.ngram_hash_params,
         )
         self._ngram_active_tokens = total_tokens
+        _sync_fence("after_ngram_prepare")
 
     def _record_pad_tape(self) -> "PrepTape | None":
         """One launch for the whole padding-tail scrub.
@@ -537,13 +562,12 @@ class InputBuffers:
         # Determine input_ids and forward_mode
         if num_extends > 0:
             prefill_token_count = sum(input_lengths[:num_extends])
-            input_ids = forward_op.input_ids
-            shifted_ids = forward_op.shifted_input_ids
+            input_ids = token_ids_int32(forward_op.input_ids)
+            shifted_ids = token_ids_int32(forward_op.shifted_input_ids)
             input_ids_cpu, shifted_ids_cpu = self._bulk_pinned(
                 (input_ids.size, torch.int32), (shifted_ids.size, torch.int32)
             )
-            # Copy the scheduler's read-only int32 views directly into this
-            # step's writable pinned storage; no intermediate token copy.
+            # Copy into this step's writable pinned storage.
             np.copyto(input_ids_cpu.numpy(), input_ids, casting="no")
             np.copyto(shifted_ids_cpu.numpy(), shifted_ids, casting="no")
             self.input_ids_buf[:prefill_token_count].copy_(

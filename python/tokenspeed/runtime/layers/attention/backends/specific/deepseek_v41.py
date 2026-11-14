@@ -43,6 +43,8 @@ holds (``V41Metadata.global_write_floor``).
 """
 
 import logging
+import os
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -98,6 +100,39 @@ from tokenspeed.runtime.utils.host_sync import allow_host_sync
 # Initial long-prefill thresholds; tune with query count and visible history.
 _INDEXER_PARTITION_MIN_QUERIES = 4096
 _INDEXER_PARTITION_MIN_HISTORY = 8192
+
+# Debug-only Ascend decode stage timing (synced). Off unless explicitly set.
+_LOG_V41_ATTN = os.environ.get("TOKENSPEED_LOG_V41_ATTN", "").strip() not in (
+    "",
+    "0",
+    "false",
+    "False",
+)
+_logger = logging.getLogger(__name__)
+_v41_attn_log_count = 0
+
+
+def _v41_attn_timing(device: torch.device) -> bool:
+    """Synced stage timers: on only outside graph capture (CUDA/NPU)."""
+    if not _LOG_V41_ATTN:
+        return False
+    from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
+
+    # Capture forbids stream synchronize; skip timing entirely until replay.
+    return not is_current_stream_capturing(device)
+
+
+def _sync_ms(device: torch.device, t0: float) -> float:
+    # Never synchronize a captured stream (Ascend EE1016 / CUDA capture rules).
+    from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
+
+    if is_current_stream_capturing(device):
+        return 0.0
+    if device.type == "cuda":
+        torch.cuda.current_stream().synchronize()
+    elif device.type == "npu":
+        torch.npu.current_stream().synchronize()
+    return (time.perf_counter() - t0) * 1000.0
 
 
 class V41CompressorPlan(NamedTuple):
@@ -1273,7 +1308,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         # Read before any writes: a scheduler-reused tail page must not destroy
         # the odd-prefix input needed by the first completed pair in this chunk.
         tail = self.cache_pool.compressor_tail(owner)
-        if content.is_cuda:
+        on_accelerator = content.is_cuda or content.device.type == "npu"
+        if on_accelerator:
             from tokenspeed_kernel.ops.attention import dsv41
 
             pooled = dsv41.compressor_pool(
@@ -1287,38 +1323,34 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 norm_weight,
                 norm_eps,
             )
-        else:
-            missing = active & (previous < 0)
-            pooled = torch.empty_like(content)
-            for start in range(0, positions.numel(), 8):
-                stop = min(start + 8, positions.numel())
-                slot = slots[start:stop].clamp_min(0)
-                history = tail[slot // 2, slot % 2]
-                prior = previous[start:stop].clamp_min(0)
-                prior_content = torch.where(
-                    missing[start:stop, None], history[:, 0], content[prior]
-                )
-                prior_scores = torch.where(
-                    missing[start:stop, None], history[:, 1], scores[prior]
-                )
-                weights = torch.stack(
-                    (prior_scores, scores[start:stop]), dim=1
-                ).softmax(1)
-                pooled[start:stop] = (
-                    weights[:, 0] * prior_content + weights[:, 1] * content[start:stop]
-                ).masked_fill(~active[start:stop, None], 0)
-        if not content.is_cuda and norm_weight is not None:
+            dsv41.compressor_tail_scatter(content, scores, tail, write_slots)
+            return pooled, pair_positions, pair_requests
+        missing = active & (previous < 0)
+        pooled = torch.empty_like(content)
+        for start in range(0, positions.numel(), 8):
+            stop = min(start + 8, positions.numel())
+            slot = slots[start:stop].clamp_min(0)
+            history = tail[slot // 2, slot % 2]
+            prior = previous[start:stop].clamp_min(0)
+            prior_content = torch.where(
+                missing[start:stop, None], history[:, 0], content[prior]
+            )
+            prior_scores = torch.where(
+                missing[start:stop, None], history[:, 1], scores[prior]
+            )
+            weights = torch.stack((prior_scores, scores[start:stop]), dim=1).softmax(1)
+            pooled[start:stop] = (
+                weights[:, 0] * prior_content + weights[:, 1] * content[start:stop]
+            ).masked_fill(~active[start:stop, None], 0)
+        if norm_weight is not None:
             normalized = pooled.to(torch.bfloat16).float()
             normalized = normalized * torch.rsqrt(
                 normalized.square().mean(-1, keepdim=True) + norm_eps
             )
             pooled = (normalized * norm_weight.float()).to(torch.bfloat16)
-        if content.is_cuda:
-            dsv41.compressor_tail_scatter(content, scores, tail, write_slots)
-        else:
-            live = write_slots >= 0
-            tail[write_slots[live] // 2, write_slots[live] % 2, 0] = content[live]
-            tail[write_slots[live] // 2, write_slots[live] % 2, 1] = scores[live]
+        live = write_slots >= 0
+        tail[write_slots[live] // 2, write_slots[live] % 2, 0] = content[live]
+        tail[write_slots[live] // 2, write_slots[live] % 2, 1] = scores[live]
         return pooled, pair_positions, pair_requests
 
     def write_global(
@@ -2245,6 +2277,82 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 self._decode_schedule_keepalive.append(schedule)
         return schedule
 
+    def _forward_v41_ascend_decode(
+        self,
+        q,
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        global_cache,
+        global_slots,
+        global_lens,
+        attn_sink,
+        softmax_scale: float,
+        *,
+        owner: int,
+        request_indices,
+        forward_mode: ForwardMode,
+    ) -> torch.Tensor:
+        """Gather FlatKV slots to BF16 PA_BBND blocks and run Ascend sparse MLA.
+
+        Packed LCM pages stay the single cache geometry; the page adapter
+        materializes only the selected SWA/global rows into the Ascend op's
+        PA_BBND ABI. KVP-sharded decode keeps the CUDA combine path above.
+        """
+        from tokenspeed_kernel.ops.attention import dsv41
+        from tokenspeed_kernel.ops.attention.dsv41.ascend import (
+            ascend_selected_attention_from_flatkv_rows,
+        )
+
+        timing = _v41_attn_timing(q.device)
+        t0 = time.perf_counter() if timing else 0.0
+        swa_rows = dsv41.cache_gather(swa_cache, swa_slots, self.swa_format, None)
+        gather_swa_ms = _sync_ms(q.device, t0) if timing else 0.0
+        global_rows = None
+        cmp_ratio = 0
+        gather_global_ms = 0.0
+        if owner >= 0:
+            if global_cache is None or global_slots is None or global_lens is None:
+                raise RuntimeError("V4.1 Ascend decode is missing global selection")
+            t1 = time.perf_counter() if timing else 0.0
+            global_rows = dsv41.cache_gather(
+                global_cache, global_slots, self.global_format, None
+            )
+            gather_global_ms = _sync_ms(q.device, t1) if timing else 0.0
+            cmp_ratio = int(self.spec.compress_ratios[owner])
+        meta = self.query_metadata(forward_mode)
+        # Live request lengths drive ratio-2 residual; decode rows index them.
+        seq_lens = meta.seq_lens.to(torch.int32)[
+            request_indices.to(torch.int64)
+        ].contiguous()
+        t2 = time.perf_counter() if timing else 0.0
+        out = ascend_selected_attention_from_flatkv_rows(
+            q,
+            swa_rows=swa_rows,
+            swa_lens=swa_lens,
+            global_rows=global_rows,
+            global_lens=global_lens,
+            attn_sink=attn_sink,
+            softmax_scale=softmax_scale,
+            cmp_ratio=cmp_ratio,
+            seq_lens=seq_lens,
+            ori_win_left=V41_WINDOW_SIZE - 1,
+            ori_win_right=0,
+        )
+        if timing:
+            sparse_ms = _sync_ms(q.device, t2)
+            global _v41_attn_log_count
+            _v41_attn_log_count += 1
+            # First 64 layer samples, then every 40th (≈ once per step).
+            if _v41_attn_log_count <= 64 or _v41_attn_log_count % 40 == 0:
+                _logger.info(
+                    "v41_attn_ms gather_swa="
+                    f"{gather_swa_ms:.3f} gather_global={gather_global_ms:.3f} "
+                    f"sparse_mla={sparse_ms:.3f} bs={q.shape[0]!s} "
+                    f"owner={owner!s} n={_v41_attn_log_count!s}"
+                )
+        return out
+
     @property
     def supports_fused_attention(self) -> bool:
         # FP8 output must follow the complete softmax, not a DCP partial.
@@ -2453,7 +2561,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         prepared = self._prepared_selections.pop(
             (layer_id, forward_mode, id(positions), id(request_indices)), None
         )
+        timing = _v41_attn_timing(q.device)
         if prepared is None:
+            select_t0 = time.perf_counter() if timing else 0.0
             global_slots, global_lens = self.select_global(
                 layer_id,
                 index_q,
@@ -2465,6 +2575,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 projected_partition=None,
                 query_shard=key_rows.plan if key_rows is not None else None,
             )
+            if timing and forward_mode.is_decode():
+                select_ms = _sync_ms(q.device, select_t0)
+                if _v41_attn_log_count <= 64 or _v41_attn_log_count % 40 == 0:
+                    _logger.info(
+                        f"v41_attn_ms select_global={select_ms:.3f} "
+                        f"bs={q.shape[0]!s} layer={layer_id!s}"
+                    )
         else:
             global_slots, global_lens = prepared[2]
         owner = self.spec.kv_owners[layer_id]
@@ -2493,6 +2610,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         if forward_mode.is_decode():
             # The current position cannot alias one of its previous 127 logical
             # rows. Ordinary retained-page writes therefore precede paged decode.
+            scatter_t0 = time.perf_counter() if timing else 0.0
             if swa_rope_cache is None:
                 dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
             else:
@@ -2507,6 +2625,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     swa_norm_weight,
                     swa_norm_eps,
                 )
+            if timing:
+                scatter_ms = _sync_ms(q.device, scatter_t0)
+                if _v41_attn_log_count <= 64 or _v41_attn_log_count % 40 == 0:
+                    _logger.info(
+                        f"v41_attn_ms scatter={scatter_ms:.3f} "
+                        f"rope={swa_rope_cache is not None!s} bs={q.shape[0]!s}"
+                    )
             swa_slots, swa_lens = (
                 (metadata.swa_read_slots, metadata.swa_read_lens)
                 if canonical
@@ -2567,6 +2692,26 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     rank=self.kvp_rank,
                     sink=attn_sink[:heads],
                     keep_all_heads=False,
+                )
+                if out_rope_cache is not None:
+                    dsv41.rope_inplace(out, positions, out_rope_cache, None)
+                return out
+            from tokenspeed_kernel.platform import current_platform
+
+            if current_platform().is_npu:
+                out = self._forward_v41_ascend_decode(
+                    q,
+                    cache,
+                    swa_slots,
+                    swa_lens,
+                    global_cache,
+                    global_slots,
+                    global_lens,
+                    attn_sink,
+                    softmax_scale,
+                    owner=owner,
+                    request_indices=request_indices,
+                    forward_mode=forward_mode,
                 )
                 if out_rope_cache is not None:
                     dsv41.rope_inplace(out, positions, out_rope_cache, None)
@@ -2758,7 +2903,27 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 else V41_PREFILL_QUERY_TILE
             )
             group = self.spec.attention_query_group
-            if fused_decode_groups is not None:
+            from tokenspeed_kernel.platform import current_platform
+
+            if current_platform().is_npu:
+                from tokenspeed_kernel.ops.attention.dsv41.ascend import (
+                    ascend_prefill_attention_from_workspace,
+                )
+
+                result = ascend_prefill_attention_from_workspace(
+                    batch_q,
+                    workspace,
+                    indices.contiguous(),
+                    swa_width=batch.swa_indices.shape[-1],
+                    attn_sink=attn_sink,
+                    softmax_scale=softmax_scale,
+                    cmp_ratio=(
+                        0 if owner < 0 else int(self.spec.compress_ratios[owner])
+                    ),
+                    seq_lens=(positions[rows].to(torch.int32) + 1).reshape(-1),
+                    ori_win_left=V41_WINDOW_SIZE - 1,
+                )
+            elif fused_decode_groups is not None:
                 # One call per batch: the fused kernel rotates this batch's
                 # queries, attends, rotates the result back and casts it, so
                 # the rows it returns are already the output projection's

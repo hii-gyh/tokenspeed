@@ -434,6 +434,9 @@ class ForwardStepRunner:
         self._metadata_snapshots: dict[tuple[str, int], dict[str, dict]] = {}
 
         self._forward_func: Callable | None = forward_func
+        # Model whose Engram buffers a decode replay refreshes. None until
+        # the executor binds one.
+        self.replay_input_model: object | None = None
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
         # The expert load counters' live-row mask (None without load
         # recording): a padded replay marks its filler rows before the graph
@@ -630,11 +633,9 @@ class ForwardStepRunner:
         observer: AbstractContextManager[None],
         variant: str = CUDA_GRAPH_VARIANT_DEFAULT,
     ):
-        graph_cls = (
-            self.device_module.NPUGraph
-            if self.device == "npu"
-            else self.device_module.CUDAGraph
-        )
+        from tokenspeed.runtime.accelerators import graph_class_for
+
+        graph_cls = graph_class_for(self.device_module, self.device)
         graph = graph_cls()
         self._prepare_request_token_history_graph_inputs(active_bs=0, padded_bs=bs)
 
@@ -1284,6 +1285,7 @@ class ForwardStepRunner:
                             {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
                         ]
                     )
+            self._refresh_replay_engram(ctx, padded_bs)
             if self._expert_load_rows is not None:
                 # Every rank replays the same padded batch; the live rows are
                 # the DP-gathered live counts (this rank's own without DP).
@@ -1329,3 +1331,16 @@ class ForwardStepRunner:
 
         self.last_graph_bs = padded_bs if use_graph else None
         return result
+
+    def _refresh_replay_engram(self, ctx: ForwardContext, padded_bs: int) -> None:
+        """Copy this step's Engram rows into the buffers the decode graph reads."""
+        model = self.replay_input_model
+        prepare = getattr(model, "prepare_engram_buffers", None)
+        if prepare is None:
+            return
+        buf = self.input_buffers.ngram_hash_ids_buf
+        if buf is None:
+            prepare(None)
+            return
+        n = max(ctx.input_num_tokens, padded_bs * self.max_tokens_per_req)
+        prepare(buf[: min(n, buf.shape[0])])

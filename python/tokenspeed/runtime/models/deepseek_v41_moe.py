@@ -46,6 +46,10 @@ from tokenspeed.runtime.layers.moe.topk import (
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.models.deepseek_v41_wide_ep import (
+    ep_dispatch_local_rows,
+    mapping_uses_wide_ep,
+)
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -178,6 +182,11 @@ def _deepseek_v4_routed_expert_quant_config(
     # ``quant_method=fp8`` describes the model-wide quantization, but DeepSeek
     # V4 can still serialize routed experts as packed MXFP4. Prefer the explicit
     # expert contract so packed FP4 tensors are never allocated as block FP8.
+    # Ascend modelslim W8A8 keeps the checkpoint quant config for INT8 experts.
+    from tokenspeed.runtime.layers.quantization.ascend import AscendQuantConfig
+
+    if isinstance(quant_config, AscendQuantConfig):
+        return quant_config, False
     is_block_fp8 = isinstance(quant_config, Fp8Config) and (
         getattr(config, "expert_dtype", None) != "fp4"
     )
@@ -253,10 +262,14 @@ class DeepseekV4MoE(nn.Module):
                     "DeepSeek V4 normal EP does not support redundant experts "
                     "with precomputed routing."
                 )
-            if mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size):
+            if (
+                mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size)
+                and not mapping_uses_wide_ep(mapping)
+            ):
                 raise ValueError(
                     "DeepSeek V4 normal EP requires attention TP size 1 or "
-                    "attention TP size equal to the MoE TPxEP size."
+                    "attention TP size equal to the MoE TPxEP size, unless "
+                    "expert parallel covers the whole world and MoE TP is 1."
                 )
             if config.hidden_size % 256:
                 raise ValueError(
@@ -271,7 +284,13 @@ class DeepseekV4MoE(nn.Module):
 
         if config.n_shared_experts is not None:
             # MegaMoE outputs are complete, so its shared expert stays dense and local.
-            if self.use_mega_moe or self.use_gluon_petit:
+            # Wide EP already sliced the attention replica's rows across that TP
+            # group, so the shared expert must own a full local copy.
+            if mapping_uses_wide_ep(mapping):
+                shared_tp_rank = 0
+                shared_tp_size = 1
+                shared_tp_group = None
+            elif self.use_mega_moe or self.use_gluon_petit:
                 shared_tp_rank = mapping.dense.tp_rank
                 shared_tp_size = mapping.dense.tp_size
                 shared_tp_group = mapping.dense.tp_group
@@ -526,8 +545,24 @@ class DeepseekV4MoE(nn.Module):
 
         The following all-reduce can read this memory in place.
         """
+        dispatch_pad = 0
         if hidden_states.shape[0] == 0 and not self.use_gluon_petit:
-            return hidden_states if out is None else out.copy_(hidden_states)
+            # An empty local batch still has to enter an all-to-all dispatch
+            # when another rank has tokens. This CANN build rejects batch 0,
+            # so the idle rank contributes one dummy row and drops it after
+            # combine.
+            rows = ep_dispatch_local_rows(
+                0,
+                num_global_tokens=num_global_tokens,
+                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                all_to_all=self.experts.supports_all_to_all_ep,
+            )
+            if rows == 0:
+                return hidden_states if out is None else out.copy_(hidden_states)
+            hidden_states = hidden_states.new_zeros((rows, hidden_states.shape[-1]))
+            if input_ids is not None and input_ids.shape[0] == 0:
+                input_ids = input_ids.new_zeros((rows, *input_ids.shape[1:]))
+            dispatch_pad = rows
         with nvtx_range("moe_select_experts"):
             topk_output = self._compute_topk_output(hidden_states, input_ids)
         deferred_finalize = (
@@ -558,10 +593,13 @@ class DeepseekV4MoE(nn.Module):
                 enable_pdl=pdl_enabled(),
                 hidden_dim=hidden_states.shape[-1],
             )
-            return result if out is None else out.copy_(result)
-        if shared is None:
-            return routed if out is None else out.copy_(routed)
-        return torch.add(routed, shared, out=out)
+        elif shared is None:
+            result = routed
+        else:
+            result = torch.add(routed, shared)
+        if dispatch_pad:
+            result = result[:-dispatch_pad]
+        return result if out is None else out.copy_(result)
 
     def forward(
         self,

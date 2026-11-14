@@ -140,6 +140,10 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
+from tokenspeed.runtime.execution.layer_kind_timing import (
+    LayerKindTimingRecorder,
+    layer_kind_scope,
+)
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41RowPlan,
@@ -179,11 +183,23 @@ from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v41_engram import (
     DeepseekV41Engram,
     EngramHashState,
+    host_load_barrier,
     is_engram_embed_checkpoint_name,
+    load_engram_rotation_block,
     resolve_engram_host_layout,
 )
 from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
 from tokenspeed.runtime.models.deepseek_v41_vision import DeepseekV41Vision
+from tokenspeed.runtime.models.deepseek_v41_wide_ep import (
+    ced_narrowing_needs_row_exchange,
+    mapping_uses_wide_ep,
+    pad_token_dim,
+    restore_gathered_tokens,
+    split_replicated_tokens,
+    unpad_token_dim,
+    wide_ep_bounds_from_rank_tokens,
+    wide_ep_dispatch_bounds,
+)
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
@@ -198,6 +214,50 @@ from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
+
+
+def _wide_ep_token_bounds(local: int, device, mapping) -> tuple[int, int]:
+    """All-gather local token counts so every expert rank shares one global batch."""
+    import torch.distributed as dist
+
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+
+    if not dist.is_initialized():
+        return local, local
+    ranks = mapping.moe.ep_group
+    group = pg_manager.get_device_process_group(ranks)
+    world = dist.get_world_size(group)
+    if world == 1:
+        return local, local
+    # ``local`` is already a host int. An NPU all-gather followed by
+    # ``.tolist()`` drains the compute stream once per MoE layer.
+    if pg_manager.has_process_group("gloo", ranks):
+        gathered_counts: list[int | None] = [None] * world
+        dist.all_gather_object(
+            gathered_counts,
+            int(local),
+            group=pg_manager.get_process_group("gloo", ranks),
+        )
+        return wide_ep_dispatch_bounds([int(value) for value in gathered_counts])
+    packed = torch.tensor([local], dtype=torch.int32, device=device)
+    gathered = torch.empty(world, dtype=torch.int32, device=device)
+    dist.all_gather_into_tensor(gathered, packed, group=group)
+    return wide_ep_dispatch_bounds([int(value) for value in gathered.tolist()])
+
+
+def _sync_fence(name: str) -> None:
+    """Synchronize when TOKENSPEED_SYNC_FENCES=1 so the failing op is named."""
+    if os.getenv("TOKENSPEED_SYNC_FENCES") != "1":
+        return
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.synchronize()
+    elif torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"[fence] {name}", flush=True)
+
+
 _ROPE_TABLES = WeakValueDictionary()
 
 
@@ -257,6 +317,19 @@ def v41_mxfp8_config(quant_config: QuantizationConfig | None) -> Mxfp8Config | N
         weight_block_size=[1, 32],
         scale_fmt="ue8m0",
     )
+
+
+def v41_dense_quant(
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Dense quant for V4.1: Ascend W8A8 pass-through, else MXFP8 1x32 scales."""
+    if quant_config is None:
+        return None
+    from tokenspeed.runtime.layers.quantization.ascend import AscendQuantConfig
+
+    if isinstance(quant_config, AscendQuantConfig):
+        return quant_config
+    return v41_mxfp8_config(quant_config)
 
 
 class _V41Fp8Config(Mxfp8Config):
@@ -538,6 +611,11 @@ def _column(input_size, output_size, dtype, quant_config, prefix, mapping):
     return layer
 
 
+def _on_accelerator(x: torch.Tensor) -> bool:
+    """CUDA or Ascend NPU — both have fused RMSNorm / linear leaves."""
+    return x.is_cuda or x.device.type == "npu"
+
+
 def _norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
     """RMSNorm in the reference cast order: FP32 scale, FP32 weight, one round."""
     if x.is_cuda:
@@ -552,7 +630,11 @@ def _norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
 
 
 def _attention_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
-    return norm(x, residual=None, out=None) if x.is_cuda else _norm(x, norm)
+    # Ratio-1 compressor and attention projections use the platform RMSNorm
+    # (Ascend ``npu_rms_norm`` via the layernorm registry on NPU).
+    return (
+        norm(x, residual=None, out=None) if _on_accelerator(x) else _norm(x, norm)
+    )
 
 
 def _merged(input_size, output_sizes, dtype, quant_config, prefix):
@@ -844,6 +926,7 @@ class DeepseekV41Compressor(nn.Module):
         elif self.ratio == 1:
             projected, _ = self.wkv(x, block_scale=None, output_dtype=None)
         else:
+            # Ascend has no dsv4_linear_fp32 leaf yet; NPU uses FP32 F.linear.
             projected = (
                 dsv4_linear_fp32(
                     x.contiguous(), self.wkv_wgate.weight, override=None, solution=None
@@ -1864,7 +1947,12 @@ class DeepseekV41MoE(DeepseekV4MoE):
 
     def _routing_inputs(self, hidden_states, image_mask):
         bias_vl = self.gate.bias_vl
-        if hidden_states.is_cuda and (bias_vl is None or image_mask is None):
+        # Text-only (or no image rows): keep the base gate / hash-MoE path on
+        # CUDA and Ascend. ``is_cuda`` alone left NPU on the vision fork that
+        # drops ``tid2eid`` / ``input_ids``.
+        if _on_accelerator(hidden_states) and (
+            bias_vl is None or image_mask is None
+        ):
             return super()._routing_inputs(hidden_states, None)
         bias = self.gate.e_score_correction_bias
         if bias_vl is not None and image_mask is not None:
@@ -1875,7 +1963,7 @@ class DeepseekV41MoE(DeepseekV4MoE):
     def _compute_topk_output(self, hidden_states, image_mask):
         gate, config = self.gate, self.topk.topk_config
         if (
-            hidden_states.is_cuda
+            _on_accelerator(hidden_states)
             and (gate.bias_vl is None or image_mask is None)
             and gate.tid2eid is None
             and not self.topk.simulate_routing
@@ -2016,7 +2104,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         self.norm_eps, self.hc_eps = config.rms_norm_eps, config.hc_eps
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_stream_fork = StreamFork(hc_stream)
-        dense_quant = v41_mxfp8_config(quant_config)
+        dense_quant = v41_dense_quant(quant_config)
         self.attn = DeepseekV41Attention(
             config,
             mapping,
@@ -2193,14 +2281,15 @@ class DeepseekV41DecoderLayer(nn.Module):
                     self.attn.mapping.attn.head_tp_group,
                 )
             )
-            x = self.attn(
-                positions,
-                x,
-                ctx,
-                reduce_output=not defer_attn,
-                hidden_codes=codes,
-                hidden_scales=scales,
-            )
+            with layer_kind_scope(ctx, "attention", self.layer_id):
+                x = self.attn(
+                    positions,
+                    x,
+                    ctx,
+                    reduce_output=not defer_attn,
+                    hidden_codes=codes,
+                    hidden_scales=scales,
+                )
             attn_pre, post, comb = attn_mixes
             if overlap:
                 for tensor in (attn_pre, post, comb):
@@ -2241,6 +2330,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             decode_hc
             and allow_ffn_reduce_fusion
             and not self.ffn.owns_ep_communication
+            and not mapping_uses_wide_ep(self.comm_manager.mapping)
             and self.comm_manager.moe_output_all_reduced(ctx)
             # All V4.1 norms share storage metadata. Admission only inspects
             # the layout; execution uses the consumer's own weight and epsilon.
@@ -2266,7 +2356,8 @@ class DeepseekV41DecoderLayer(nn.Module):
                         self.hc_eps,
                         self.hc_sinkhorn_iters,
                     )
-            x = self._forward_ffn(x, image_mask, ctx, defer_reduce=defer_moe)
+            with layer_kind_scope(ctx, "ffn", self.layer_id):
+                x = self._forward_ffn(x, image_mask, ctx, defer_reduce=defer_moe)
             ffn_pre, post, comb = ffn_mixes
             if ffn_overlap:
                 for tensor in (ffn_pre, post, comb):
@@ -2301,11 +2392,51 @@ class DeepseekV41DecoderLayer(nn.Module):
 
         With defer_reduce, the pending plain all-reduce over the MoE TPxEP
         group is left to the caller; admission guarantees one is required.
+        Wide EP never uses that all-reduce: each attention rank sends a
+        stride of the replicated batch, and the slices are gathered back
+        onto the attention group before the residual is added.
         """
         ctx = self._ffn_context(ctx)
+        wide_ep = mapping_uses_wide_ep(self.comm_manager.mapping)
+        wide_pad = 0
+        if wide_ep:
+            if defer_reduce:
+                raise ValueError("wide EP does not defer the MoE reduction")
+            if self.ffn.owns_ep_communication:
+                raise ValueError("wide EP does not use expert-owned communication")
+            attn = self.comm_manager.mapping.attn
+            x, wide_pad = pad_token_dim(x, attn.tp_size)
+            if image_mask is not None:
+                image_mask, _ = pad_token_dim(image_mask, attn.tp_size)
+            x = split_replicated_tokens(x, attn.tp_rank, attn.tp_size)
+            if image_mask is not None:
+                image_mask = split_replicated_tokens(
+                    image_mask, attn.tp_rank, attn.tp_size
+                )
+            if ctx is not None and ctx.wide_ep_bounds is not None:
+                total, maximum = ctx.wide_ep_bounds
+            else:
+                total, maximum = _wide_ep_token_bounds(
+                    x.shape[0], x.device, self.comm_manager.mapping
+                )
+            # Idle attention groups pass a 0-row tensor. The MoE joins the
+            # same dispatch with one dummy row, because this op rejects batch 0.
+            x = self.ffn(
+                x, image_mask, total, maximum, ctx=None, comm_manager=None, out=None
+            )
+            from tokenspeed.runtime.distributed.comm_ops import token_all_gather
+
+            gathered = token_all_gather(
+                x,
+                group=attn.tp_group,
+                scattered_num_tokens=[x.shape[0]] * attn.tp_size,
+            )
+            return unpad_token_dim(
+                restore_gathered_tokens(gathered, attn.tp_size), wide_pad
+            )
         # Fused EP returns this rank's rows, including an empty tensor on idle
         # ranks. HC residuals therefore stay local across dispatch/combine.
-        if self.ffn.owns_ep_communication:
+        elif self.ffn.owns_ep_communication:
             if defer_reduce:
                 raise ValueError(
                     "Expert-owned communication cannot defer its reduction"
@@ -2456,9 +2587,16 @@ class DeepseekV41Model(nn.Module):
             == mapping.moe.tp_size
             == 1
         )
-        if mapping.attn.tp_size != mapping.moe.tp_ep_size and not local_fused_ep:
+        wide_ep = mapping_uses_wide_ep(mapping)
+        if (
+            mapping.attn.tp_size != mapping.moe.tp_ep_size
+            and not local_fused_ep
+            and not wide_ep
+        ):
             raise NotImplementedError(
-                "V4.1 requires attention TP == MoE TPxEP or fused EP with attention/dense/MoE TP1"
+                "V4.1 requires attention TP == MoE TPxEP, fused EP with "
+                "attention/dense/MoE TP1, or attention TP over a world-sized "
+                "expert group with MoE TP 1"
             )
         if config.hc_mult != 4 or config.hc_sinkhorn_iters < 1:
             raise ValueError(
@@ -2538,6 +2676,10 @@ class DeepseekV41Model(nn.Module):
         self.decoder_uses_engram = any(
             layer_id > self.ced_decoder_start for layer_id in config.engram_layer_ids
         )
+        # Event samples are logged by later forwards after non-blocking completion
+        # polls; only DP rank 0's first TP rank allocates timing events.
+        timing_rank = int(mapping.attn.dp_rank != 0 or mapping.attn.tp_rank != 0)
+        self._layer_kind_timing = LayerKindTimingRecorder(rank=timing_rank)
 
     def initialize_engram(self, tokenizer) -> None:
         """Initialize immutable tokenizer/hash constants once; never request history."""
@@ -2569,6 +2711,7 @@ class DeepseekV41Model(nn.Module):
         invocations are unsupported. The four stages below are the whole
         forward; the prefill graph calls them individually.
         """
+        self._bind_wide_ep_bounds(ctx)
         if ctx.query_shard is not None and (
             image_mask is not None or input_embeds is not None
         ):
@@ -2599,20 +2742,32 @@ class DeepseekV41Model(nn.Module):
                 None,
             )
         backend = ctx.attn_backend
-        backend.begin_indexer_forward()
-        state = self.encoder_forward(
-            input_ids,
-            positions,
-            ctx,
-            input_embeds,
-            pp_inbound,
-            engram_hash_ids=engram_hash_ids,
-            engram_token_mask=engram_token_mask,
-            image_mask=image_mask,
+        timer = self._layer_kind_timing.start(
+            self.embed_tokens.weight.device,
+            mode=ctx.forward_mode.name,
+            bs=ctx.bs,
         )
-        state = self.narrowing_forward(state, ctx)
-        hidden, captured = self.decoder_forward(state, ctx)
-        output = self.finish_forward(hidden, captured, ctx)
+        ctx.layer_kind_timer = timer
+        try:
+            backend.begin_indexer_forward()
+            state = self.encoder_forward(
+                input_ids,
+                positions,
+                ctx,
+                input_embeds,
+                pp_inbound,
+                engram_hash_ids=engram_hash_ids,
+                engram_token_mask=engram_token_mask,
+                image_mask=image_mask,
+            )
+            state = self.narrowing_forward(state, ctx)
+            hidden, captured = self.decoder_forward(state, ctx)
+            output = self.finish_forward(hidden, captured, ctx)
+        finally:
+            self._clear_staged_engram()
+            ctx.layer_kind_timer = None
+            if timer is not None:
+                self._layer_kind_timing.finish(timer)
         backend.end_indexer_forward()
         return output
 
@@ -2630,35 +2785,89 @@ class DeepseekV41Model(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, V41HCPost | None]:
         """Finish an incoming post before Engram; capture the input after it."""
         if layer.engram is not None:
+            _sync_fence(f"before_engram_layer_{layer.layer_id}")
             if pending_post is not None:
-                hidden = pending_post.finish(hidden)
+                with layer_kind_scope(ctx, "hc_post", layer.layer_id):
+                    hidden = pending_post.finish(hidden)
                 pending_post = None
-            hidden = layer.engram(
+            with layer_kind_scope(ctx, "engram", layer.layer_id):
+                hidden = layer.engram(
+                    hidden,
+                    state.hashes[:, layer.engram.layer_hash_index],
+                    state.engram_token_mask,
+                    query_shard=(
+                        _row_plan(layer.layer_id, self.ced_decoder_start, ctx).source_shard
+                        if ctx.query_shard is not None
+                        else None
+                    ),
+                )
+        with layer_kind_scope(ctx, "layer", layer.layer_id):
+            hidden, pre_mix, pending_post, tap = layer(
                 hidden,
-                state.hashes[:, layer.engram.layer_hash_index],
-                state.engram_token_mask,
-                query_shard=(
-                    _row_plan(layer.layer_id, self.ced_decoder_start, ctx).source_shard
-                    if ctx.query_shard is not None
-                    else None
-                ),
+                pre_mix,
+                state.positions,
+                state.image_mask,
+                ctx,
+                pending_post=pending_post,
+                # Stage handoffs and Engram require a complete HC stream. Admit
+                # deferred reduction only when the next input can consume it fused.
+                allow_ffn_reduce_fusion=layer.layer_id + 1 < stage_end
+                and self.layers[layer.layer_id + 1].engram is None,
+                capture_input=layer.layer_id in self.dspark_capture_layers,
             )
-        hidden, pre_mix, pending_post, tap = layer(
-            hidden,
-            pre_mix,
-            state.positions,
-            state.image_mask,
-            ctx,
-            pending_post=pending_post,
-            # Stage handoffs and Engram require a complete HC stream. Admit
-            # deferred reduction only when the next input can consume it fused.
-            allow_ffn_reduce_fusion=layer.layer_id + 1 < stage_end
-            and self.layers[layer.layer_id + 1].engram is None,
-            capture_input=layer.layer_id in self.dspark_capture_layers,
-        )
         if tap is not None:
             captured.append(tap)
         return hidden, pre_mix, pending_post
+
+    def _bind_wide_ep_bounds(self, ctx: ForwardContext) -> None:
+        """One dispatch capacity for every wide-EP layer in this forward.
+
+        The scheduler gathered ``global_num_tokens`` before the model runs.
+        Narrowed decoder layers reuse that capacity instead of all-gathering
+        again inside the layer.
+        """
+        ctx.wide_ep_bounds = None
+        if not self.layers:
+            return
+        mapping = self.layers[0].comm_manager.mapping
+        if not mapping_uses_wide_ep(mapping) or ctx.global_num_tokens is None:
+            return
+        ctx.wide_ep_bounds = wide_ep_bounds_from_rank_tokens(
+            [ctx.global_num_tokens[rank] for rank in mapping.moe.ep_group],
+            mapping.attn.tp_size,
+        )
+
+    def _stage_engram(self, hashes: torch.Tensor | None, layers) -> None:
+        """Gather this stage's Engram rows into each layer's fixed buffer.
+
+        Host INT8 tables cannot be indexed on the NPU. The gather runs before
+        the stage, and decode-graph replay refreshes the same storage before
+        ``graph.replay``. Capture itself only reads that storage.
+        """
+        from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
+
+        if hashes is None or get_is_capture_mode():
+            return
+        device = self.embed_tokens.weight.device
+        cpu_hashes = hashes.detach()
+        if cpu_hashes.device.type != "cpu":
+            cpu_hashes = cpu_hashes.to(device="cpu")
+        for layer in layers:
+            engram = layer.engram
+            if engram is None:
+                continue
+            fresh = engram.embed(
+                cpu_hashes[:, engram.layer_hash_index],
+                out_device=device,
+            )
+            engram.hold_prepared(fresh)
+
+    def prepare_engram_buffers(self, hashes: torch.Tensor | None) -> None:
+        """Fill every Engram layer from this step's hash ids."""
+        self._stage_engram(hashes, self.layers)
+
+    def _clear_staged_engram(self) -> None:
+        return
 
     def encoder_forward(
         self,
@@ -2700,11 +2909,14 @@ class DeepseekV41Model(nn.Module):
                 raise ValueError(
                     "Engram prepared hashes/mask have the wrong shape or dtype"
                 )
+        with layer_kind_scope(ctx, "engram_stage", -1):
+            self._stage_engram(hashes, self.layers[: self.ced_decoder_start])
         h = (
             self.embed_tokens(input_ids, query_shard=ctx.query_shard)
             if input_embeds is None
             else input_embeds
         )
+        _sync_fence("after_token_embed")
         if h.shape != (input_ids.numel(), self.config.hidden_size):
             raise ValueError("V4.1 input embeddings have the wrong shape")
         if h.is_cuda:
@@ -2762,17 +2974,19 @@ class DeepseekV41Model(nn.Module):
         view = backend.decoder_view()
         # Checked here, in the stage that always runs eagerly: a replayed
         # encoder graph would skip a check placed before it.
-        if (
-            view.keep_rows is not None
-            and ctx.query_shard is None
-            and ctx.global_num_tokens is not None
-            and not self.layers[start].ffn.owns_ep_communication
+        if ctx.query_shard is None and ced_narrowing_needs_row_exchange(
+            keep_rows_present=view.keep_rows is not None,
+            has_global_token_counts=ctx.global_num_tokens is not None,
+            owns_ep_communication=self.layers[start].ffn.owns_ep_communication,
+            wide_ep=mapping_uses_wide_ep(self.layers[start].comm_manager.mapping),
         ):
             raise NotImplementedError(
                 "V4.1 CED narrowing under attention data parallelism needs the "
                 "narrowed row counts exchanged across ranks"
             )
         captured = list(state.captured)
+        with layer_kind_scope(ctx, "engram_stage", -1):
+            self._stage_engram(state.hashes, self.layers[start : start + 1])
         # Fused EP exchanges actual local row counts inside its dispatch. The
         # original DP counts remain valid capacity bounds after CED narrowing;
         # no host exchange is needed for its routed or rank-local shared experts.
@@ -2837,6 +3051,8 @@ class DeepseekV41Model(nn.Module):
             )
             return hidden, captured
         ctx.attn_backend.begin_indexer_stage()
+        with layer_kind_scope(ctx, "engram_stage", -1):
+            self._stage_engram(state.hashes, self.layers[start + 1 :])
         pending_post = None
         layers = self.layers[start + 1 :]
         if layers:
@@ -3127,6 +3343,14 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
 
     def bind_checkpoint_dir(self, checkpoint_dir: str) -> None:
         self._checkpoint_dir = checkpoint_dir
+        if self.model is None:
+            return
+        block = load_engram_rotation_block(
+            checkpoint_dir, self.model.config.hidden_size
+        )
+        for layer in self.model.layers:
+            if layer.engram is not None:
+                layer.engram.set_rotation_block(block)
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         if self.encoder_only:
@@ -3406,7 +3630,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 skipped[reason] += 1
                 continue
             expert = re.fullmatch(
-                r"layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)", name
+                r"layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale|weight_scale|weight_offset)",
+                name,
             )
             if expert:
                 layer_id, expert_id = int(expert[1]), int(expert[2])
@@ -3420,27 +3645,46 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     if expert[3] == "w2"
                     else (config.moe_intermediate_size, config.hidden_size)
                 )
-                expected = (n, k // (32 if expert[4] == "scale" else 2))
+                field = expert[4]
+                # MXFP4 packs two codes per byte (K/2). Ascend W8A8 stores full
+                # int8 weights plus a per-channel scale and offset.
+                if field == "scale":
+                    expected = (n, k // 32)
+                elif field == "weight" and tensor.dtype == torch.int8:
+                    expected = (n, k)
+                elif field in ("weight_scale", "weight_offset"):
+                    expected = (n, 1) if tensor.ndim == 2 else (n,)
+                else:
+                    expected = (n, k // 2)
                 if tuple(tensor.shape) != expected:
                     raise ValueError(
                         f"{raw_name}: expected {expected}, got {tuple(tensor.shape)}"
                     )
-                allowed = (
-                    (torch.uint8, torch.float8_e8m0fnu)
-                    if expert[4] == "scale"
-                    else (torch.int8, torch.uint8, torch.float4_e2m1fn_x2)
-                )
+                if field == "scale":
+                    allowed = (torch.uint8, torch.float8_e8m0fnu)
+                elif field == "weight" and tensor.dtype == torch.int8:
+                    allowed = (torch.int8,)
+                elif field in ("weight_scale", "weight_offset"):
+                    allowed = (torch.float32, torch.bfloat16, torch.int32)
+                else:
+                    allowed = (torch.int8, torch.uint8, torch.float4_e2m1fn_x2)
                 if tensor.dtype not in allowed:
                     raise TypeError(
-                        f"{raw_name}: expected packed FP4/E8M0, got {tensor.dtype}"
+                        f"{raw_name}: expected packed FP4/E8M0 or Ascend W8A8, "
+                        f"got {tensor.dtype}"
                     )
                 local_count = config.n_routed_experts // self.mapping.moe.ep_size
                 if expert_id // local_count != self.mapping.moe.ep_rank:
                     skipped["remote_expert"] += 1
                     continue
-                if name not in targets:
+                if name not in targets and not name.endswith(
+                    (".weight_scale", ".weight_offset")
+                ):
                     raise ValueError(f"Unexpected V4.1 expert tensor: {raw_name}")
-                tensor = tensor.view(torch.uint8)
+                if tensor.dtype != torch.int8 and not name.endswith(
+                    (".weight_scale", ".weight_offset")
+                ):
+                    tensor = tensor.view(torch.uint8)
                 ffn = self.model.layers[layer_id].ffn
                 if ffn.use_mega_moe:
                     extra = ffn.experts.intermediate_size - config.moe_intermediate_size
@@ -3456,7 +3700,16 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                             mode="constant",
                             value=127 if expert[4] == "scale" else 0,
                         )
-                mapped = "model." + name.replace(".scale", ".weight_scale")
+                if name.endswith(".scale"):
+                    mapped = "model." + name[: -len(".scale")] + ".weight_scale"
+                else:
+                    mapped = "model." + name
+                # INT8 MoE stores per-channel scales, not a separate offset.
+                # A zero offset is the checkpoint's symmetric case.
+                if name.endswith(".weight_offset"):
+                    if mapped not in params and not bool(tensor.any()):
+                        loaded.add(name)
+                        continue
                 moe_loader.load(mapped, tensor)
             elif name.endswith((".attn.wo_a.weight", ".attn.wo_a.scale")):
                 weight_name = name.rsplit(".", 1)[0] + ".weight"
@@ -3481,8 +3734,14 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                         else module.output_sizes[shard_id]
                     )
                     expected = (n, module.input_size)
-                    if name.endswith(".scale"):
-                        expected = tuple((dim + 31) // 32 for dim in expected)
+                    if name.endswith(".weight"):
+                        expected = (n, module.input_size)
+                    elif name.endswith(".scale"):
+                        expected = tuple(
+                            (dim + 31) // 32 for dim in (n, module.input_size)
+                        )
+                    elif name.endswith((".weight_scale", ".weight_offset")):
+                        expected = (n, 1) if param.ndim == 2 else (n,)
                 elif isinstance(module, VocabParallelEmbedding):
                     expected = (module.num_embeddings, module.embedding_dim)
                 elif name.endswith(".attn_sink"):
@@ -3499,11 +3758,21 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                         f"{raw_name}: expected checkpoint FP8 E4M3, got {tensor.dtype}"
                     )
                 if not expects_fp8 and not name.endswith(".scale"):
-                    fp32 = ".hc_" in name or name.endswith(
-                        (".attn_sink", ".ffn.gate.bias", ".ffn.gate.bias_vl")
-                    )
-                    dtype = torch.float32 if fp32 else torch.bfloat16
-                    if tensor.dtype != dtype:
+                    if param.dtype == torch.int8:
+                        dtype = torch.int8
+                    elif name.endswith((".weight_scale", ".weight_offset")):
+                        if tensor.dtype not in (torch.float32, param.dtype):
+                            raise TypeError(
+                                f"{raw_name}: expected float32 Ascend scale/offset, "
+                                f"got {tensor.dtype}"
+                            )
+                        dtype = None
+                    else:
+                        fp32 = ".hc_" in name or name.endswith(
+                            (".attn_sink", ".ffn.gate.bias", ".ffn.gate.bias_vl")
+                        )
+                        dtype = torch.float32 if fp32 else torch.bfloat16
+                    if dtype is not None and tensor.dtype != dtype:
                         raise TypeError(
                             f"{raw_name}: expected {dtype}, got {tensor.dtype}"
                         )
@@ -3515,6 +3784,10 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             else:
                 raise ValueError(f"Unexpected V4.1 checkpoint tensor: {raw_name}")
             loaded.add(name)
+            # Ascend W8A8 experts are named ``.weight_scale``. The coverage
+            # map still records the MXFP4 checkpoint constituent ``.scale``.
+            if name.endswith(".weight_scale"):
+                loaded.add(name.removesuffix(".weight_scale") + ".scale")
         self._load_missing_engram_tables(loaded)
         missing = set(targets) - loaded
         for key, pair in pending.items():
@@ -3544,11 +3817,25 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         from safetensors import safe_open
         from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-        index_path = os.path.join(checkpoint_dir, SAFE_WEIGHTS_INDEX_NAME)
-        if not os.path.isfile(index_path):
+        # HF packs use model.safetensors.index.json. Ascend modelslim packs
+        # keep the same weight_map in quant_model_weights.safetensors.index.json
+        # and point Engram tables at the standalone engram_embed_*.safetensors.
+        index_names = (
+            SAFE_WEIGHTS_INDEX_NAME,
+            "quant_model_weights.safetensors.index.json",
+        )
+        index_path = next(
+            (
+                os.path.join(checkpoint_dir, name)
+                for name in index_names
+                if os.path.isfile(os.path.join(checkpoint_dir, name))
+            ),
+            None,
+        )
+        if index_path is None:
             raise FileNotFoundError(
-                f"Engram slice load requires {SAFE_WEIGHTS_INDEX_NAME} in "
-                f"{checkpoint_dir}"
+                "Engram slice load requires one of "
+                f"{', '.join(index_names)} in {checkpoint_dir}"
             )
         with open(index_path) as handle:
             weight_map = json.load(handle)["weight_map"]
@@ -3571,8 +3858,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             with safe_open(shard, framework="pt", device="cpu") as handle:
                 embed.load_sharded(field, handle.get_slice(mapped), 65536)
             loaded.add(raw)
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        if self.model is not None:
+            host_load_barrier(self.model.mapping.world_group)
 
     def post_load_weights(self) -> None:
         for module in self.modules():

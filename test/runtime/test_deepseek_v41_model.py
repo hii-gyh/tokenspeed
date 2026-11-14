@@ -3918,6 +3918,44 @@ def test_generic_safetensors_engram_load_is_bounded(monkeypatch, tmp_path):
     )
 
 
+def test_text_routing_inputs_use_base_path_on_accelerator(monkeypatch):
+    """NPU must not take the vision fork when bias_vl is unused."""
+    moe = v41.DeepseekV41MoE.__new__(v41.DeepseekV41MoE)
+    nn.Module.__init__(moe)
+    tid2eid = torch.arange(8, dtype=torch.int32).view(2, 4)
+    moe.gate = SimpleNamespace(
+        weight=torch.eye(4),
+        e_score_correction_bias=torch.zeros(4),
+        bias_vl=None,
+        tid2eid=tid2eid,
+    )
+    hidden = torch.randn(2, 4)
+    seen = {}
+
+    def fake_super_routing(hidden_states, input_ids):
+        seen["input_ids"] = input_ids
+        return (
+            hidden_states @ moe.gate.weight.T,
+            moe.gate.e_score_correction_bias,
+            moe.gate.tid2eid,
+            input_ids,
+        )
+
+    monkeypatch.setattr(v41, "_on_accelerator", lambda tensor: True)
+    monkeypatch.setattr(
+        v41.DeepseekV4MoE,
+        "_routing_inputs",
+        lambda self, hidden_states, input_ids: fake_super_routing(
+            hidden_states, input_ids
+        ),
+    )
+    logits, bias, table, ids = moe._routing_inputs(hidden, None)
+    assert seen["input_ids"] is None
+    assert table is tid2eid and ids is None
+    assert bias is moe.gate.e_score_correction_bias
+    torch.testing.assert_close(logits, hidden @ moe.gate.weight.T)
+
+
 @pytest.mark.parametrize("topk", [1, 2])
 @pytest.mark.parametrize(
     "vision,with_images", [(False, False), (True, False), (True, True)]

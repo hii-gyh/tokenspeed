@@ -1081,6 +1081,16 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
     assert all(spec.transfer_policy is None for spec in specs.values())
 
 
+def test_npu_workspace_reserves_the_eager_attention_matmul():
+    cpu = _recipe("cpu")
+    npu = _recipe("npu")
+    spec = npu.attn_config.component(DeepseekV41Config)
+    npu.attn_config = replace(
+        npu.attn_config, components=(replace(spec, cache_format="v41"),)
+    )
+    assert npu.workspace_bytes() - cpu.workspace_bytes() == 5 * (1 << 30)
+
+
 @pytest.mark.parametrize("chunk", [4096, 32768])
 @pytest.mark.parametrize("overlap_depth", [0, 1])
 def test_workspace_reserves_full_paged_decode_scores(chunk, overlap_depth):

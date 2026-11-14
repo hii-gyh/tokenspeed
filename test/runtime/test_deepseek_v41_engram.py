@@ -56,8 +56,10 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     EngramHashState,
     EngramLayout,
     RowShardedEngramEmbedding,
+    _dequant_int8_group32,
     build_compressed_token_map,
     compute_hash_multipliers,
+    load_engram_rotation_block,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -239,6 +241,60 @@ def test_token_compression_and_layout():
     config.engram_compressed_vocab_size = 10
     with pytest.raises(ValueError, match="compressed vocabulary"):
         EngramHashState(config, _Tokenizer(), "cpu")
+
+
+def test_int8_group32_dequant_matches_symmetric_reference():
+    torch.manual_seed(0)
+    codes = torch.randint(-127, 128, (3, 64), dtype=torch.int8)
+    scales = torch.randn(3, 2, dtype=torch.float32).abs() + 1e-3
+    actual = _dequant_int8_group32(codes, scales)
+    expected = (
+        codes.float().unflatten(-1, (-1, 32)) * scales.unsqueeze(-1)
+    ).flatten(-2).bfloat16()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_host_int8_row_ids_resolve_on_cpu():
+    from tokenspeed.runtime.models.deepseek_v41_engram import _host_int8_row_ids
+
+    indices = torch.tensor([[0, 3, -1, 8, 7]], dtype=torch.int64)
+    ids, valid = _host_int8_row_ids(indices, 0, 8)
+    assert ids.device.type == "cpu" and ids.dtype == torch.long
+    assert valid.device.type == "cpu"
+    assert ids.tolist() == [[0, 3, 0, 0, 7]]
+    assert valid.tolist() == [[True, True, False, False, True]]
+
+
+def test_int8_host_table_gathers_on_table_device():
+    rows, width = 8, 64
+    torch.manual_seed(0)
+    codes = torch.randint(-127, 128, (rows, width), dtype=torch.int8)
+    scales = torch.rand(rows, width // 32) + 0.1
+    embed = RowShardedEngramEmbedding(
+        rows,
+        width,
+        _mapping(0, 1, 1),
+        "cpu",
+        True,
+        "shared",
+        1,
+        weight_dtype=torch.int8,
+        scale_dtype=torch.float32,
+    )
+    embed.weight_loader(embed.weight, codes)
+    embed.weight_loader(embed.scale, scales)
+    indices = torch.tensor([[0, 3, -1, 8, 7]])
+    actual = embed(indices)
+    expected = _dequant_int8_group32(codes, scales)[indices.clamp(0, rows - 1)].clone()
+    expected[(indices < 0) | (indices >= rows)] = 0
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.device.type == "cpu"
+    if not torch.cuda.is_available():
+        return
+    gpu_ids = indices.cuda()
+    gpu_out = embed(gpu_ids)
+    assert gpu_out.device.type == "cuda"
+    torch.testing.assert_close(gpu_out.cpu(), expected, rtol=0, atol=0)
 
 
 def test_history_chunk_prefix_reorder_and_speculative_rollback():
@@ -478,6 +534,51 @@ def test_gate_matches_reference_and_mask_is_identity():
         rtol=0,
         atol=0,
     )
+
+
+def test_gate_undoes_quarot_block_on_residual_only():
+    """Ascend W8A8: gate dots in the original basis; value adds stay residual."""
+    torch.manual_seed(7)
+    model = _model("cpu", None)
+    codes, scales = _weights(72, 32)
+    model.embed.weight_loader(model.embed.weight, codes)
+    model.embed.weight_loader(model.embed.scale, scales)
+    model.wkv.weight.data.copy_(torch.randn(160, 192) * 0.03)
+    model.q_weight.data.copy_(torch.randn(4, 32))
+    model.k_weight.data.copy_(torch.randn(4, 32))
+    # Orthogonal-ish 32x32 block; not identity so undo changes the gate.
+    block = torch.linalg.qr(torch.randn(32, 32))[0].float()
+    model.set_rotation_block(block)
+    ids = torch.randint(72, (2, 3, 6))
+    hidden = torch.randn(2, 3, 4, 32, dtype=torch.bfloat16)
+    mask = torch.ones(2, 3, dtype=torch.bool)
+    kv = F.linear(_dequant(codes, scales)[ids].flatten(-2), model.wkv.weight)
+    key, value = kv[..., :128].float().reshape(2, 3, 4, 32), kv[..., 128:].float()
+    h = hidden.float()
+    original = (h.unflatten(-1, (-1, 32)) @ block.T).flatten(-2)
+    qnorm = original * torch.rsqrt(original.square().mean(-1, keepdim=True) + 1e-20)
+    knorm = key * torch.rsqrt(key.square().mean(-1, keepdim=True) + 1e-20)
+    dot = (qnorm * model.q_weight.float() * knorm * model.k_weight.float()).sum(
+        -1
+    ) / 32**0.5
+    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(1e-6).sqrt(), dot))
+    expected = (h + gate.unsqueeze(-1) * value.unsqueeze(-2)).to(hidden.dtype)
+    torch.testing.assert_close(model(hidden, ids, mask), expected, rtol=0, atol=0)
+    # Without undo the gate would differ for a non-identity block.
+    model.set_rotation_block(None)
+    assert not torch.allclose(model(hidden, ids, mask), expected, rtol=0, atol=0)
+
+
+def test_load_engram_rotation_block_accepts_tiled_global(tmp_path: Path):
+    block = torch.linalg.qr(torch.randn(32, 32))[0].float()
+    global_rotation = torch.block_diag(*([block] * 2))
+    optional = tmp_path / "optional"
+    optional.mkdir()
+    save_file({"global_rotation": global_rotation}, optional / "quarot.safetensors")
+    loaded = load_engram_rotation_block(str(tmp_path), hidden_size=64)
+    assert loaded is not None
+    torch.testing.assert_close(loaded, block, rtol=0, atol=0)
+    assert load_engram_rotation_block(str(tmp_path / "missing"), 64) is None
 
 
 @pytest.mark.parametrize("config_class", [Fp8Config, Mxfp8Config])
@@ -1047,7 +1148,32 @@ def test_host_table_job_id_is_pid_scoped(tmp_path, monkeypatch):
     engram._HOST_TABLE_JOB_ID = None
 
 
-def test_checkpoint_filter_skips_engram_embed_only():
+def test_host_load_barrier_uses_the_cpu_group(monkeypatch):
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+    from tokenspeed.runtime.models.deepseek_v41_engram import host_load_barrier
+
+    seen = {}
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+    monkeypatch.setattr(
+        pg_manager, "has_process_group", lambda backend, group: backend == "gloo"
+    )
+    def get_process_group(backend, group):
+        seen["group"] = (backend, group)
+        return "cpu-group"
+
+    monkeypatch.setattr(pg_manager, "get_process_group", get_process_group)
+
+    def barrier(group=None):
+        seen["barrier"] = group
+
+    monkeypatch.setattr(torch.distributed, "barrier", barrier)
+    host_load_barrier((0, 1, 2, 3))
+    assert seen["group"] == ("gloo", (0, 1, 2, 3))
+    assert seen["barrier"] == "cpu-group"
     from tokenspeed.runtime.models.deepseek_v41_engram import (
         is_engram_embed_checkpoint_name,
     )

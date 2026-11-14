@@ -652,6 +652,45 @@ def block_tables_from_forward_op(
     ).tables
 
 
+def _forward_op_windows_and_spans(
+    forward_op: Any,
+) -> tuple[list[tuple[str, np.ndarray, int]], dict[str, np.ndarray]]:
+    """Read compact row windows and spans from a forward op.
+
+    Prefer ``block_table_windows`` / ``block_table_spans``. When a ts-host
+    binary embeds an older scheduler extension that only exposes absolute
+    ``block_tables_arrays``, treat each absolute table as a full-width window
+    with ``released=0`` and ``pages=columns`` so packing still expands to the
+    same absolute rows.
+    """
+    if hasattr(forward_op, "block_table_windows") and hasattr(
+        forward_op, "block_table_spans"
+    ):
+        window_items = [
+            (str(key), array, columns)
+            for key, (array, columns) in forward_op.block_table_windows().items()
+        ]
+        spans_by_id = {
+            str(key): spans for key, spans in forward_op.block_table_spans().items()
+        }
+        return window_items, spans_by_id
+
+    arrays = forward_op.block_tables_arrays()
+    window_items: list[tuple[str, np.ndarray, int]] = []
+    spans_by_id: dict[str, np.ndarray] = {}
+    for key, array in arrays.items():
+        group_id = str(key)
+        arr = np.asarray(array, dtype=np.int32)
+        if arr.ndim != 2:
+            raise ValueError(f"cache group {group_id!r} has invalid shape")
+        columns = int(arr.shape[1])
+        window_items.append((group_id, arr, columns))
+        spans = np.zeros((arr.shape[0], 2), dtype=np.int32)
+        spans[:, 1] = columns
+        spans_by_id[group_id] = spans
+    return window_items, spans_by_id
+
+
 def packed_block_tables_from_forward_op(
     forward_op: Any,
     device: "torch.device | str",
@@ -723,13 +762,7 @@ def packed_block_tables_from_forward_op(
             raise ValueError(
                 f"expected_group_ids contains duplicates: {sorted(duplicate_group_ids)}"
             )
-    window_items = [
-        (str(key), array, columns)
-        for key, (array, columns) in forward_op.block_table_windows().items()
-    ]
-    spans_by_id = {
-        str(key): spans for key, spans in forward_op.block_table_spans().items()
-    }
+    window_items, spans_by_id = _forward_op_windows_and_spans(forward_op)
     if strict_validation:
         normalized_group_ids: set[str] = set()
         collided_ids: set[str] = set()
