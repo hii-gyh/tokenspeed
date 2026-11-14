@@ -70,7 +70,7 @@ def _layout(cache_format: str):
     return _LAYOUTS[cache_format]
 
 
-def _flat_pages(cache: torch.Tensor, row_bytes: int) -> torch.Tensor:
+def _validate_cache_pages(cache: torch.Tensor, row_bytes: int) -> None:
     if (
         cache.dtype != torch.uint8
         or cache.ndim != 3
@@ -82,9 +82,46 @@ def _flat_pages(cache: torch.Tensor, row_bytes: int) -> torch.Tensor:
         )
     if cache.stride(2) != 1 or cache.stride(1) != row_bytes:
         raise ValueError("cache pages must have contiguous row bytes")
+
+
+def _flat_pages(cache: torch.Tensor, row_bytes: int) -> torch.Tensor:
+    _validate_cache_pages(cache, row_bytes)
     return cache.as_strided(
         (cache.shape[0], _PAGE_ROWS * row_bytes), (cache.stride(0), 1)
     )
+
+
+def _as_flat1d(flat: torch.Tensor) -> torch.Tensor:
+    """1-D storage view covering ``page * stride(0) + col`` without densifying.
+
+    Ascend ``reshape(-1)`` on the page-flat ``as_strided`` view copies the whole
+    pool (~16 GiB) and OOMs under post-load headroom (~11 GiB free). Keep a view
+    so scatter/gather only touch selected bytes; offsets still use page stride.
+    """
+    pages = int(flat.shape[0])
+    page_bytes = int(flat.shape[1])
+    page_stride = int(flat.stride(0))
+    if pages == 0:
+        return flat.as_strided((0,), (1,))
+    storage_len = (pages - 1) * page_stride + page_bytes
+    return flat.as_strided((storage_len,), (1,))
+
+
+def _cache_flat1d(cache: torch.Tensor, row_bytes: int) -> tuple[torch.Tensor, int]:
+    """Byte-addressable 1-D view of ``cache`` plus its page stride.
+
+    Dense contiguous pools use ``cache.view(-1)`` so Ascend index-gathers hit the
+    fast contiguous path (the as_strided chain after ``_flat_pages`` was ~2.5×
+    slower on gather_global vs the 5a baseline). Padded arenas keep
+    ``_as_flat1d`` — never ``reshape(-1)`` densify or ``flat[page]``.
+    """
+    _validate_cache_pages(cache, row_bytes)
+    page_stride = int(cache.stride(0))
+    page_bytes = _PAGE_ROWS * row_bytes
+    if cache.is_contiguous() and page_stride == page_bytes:
+        return cache.view(-1), page_stride
+    flat = cache.as_strided((cache.shape[0], page_bytes), (page_stride, 1))
+    return _as_flat1d(flat), page_stride
 
 
 def _e2m1_decode(nibbles: torch.Tensor) -> torch.Tensor:
@@ -346,7 +383,8 @@ def _winning_values(
 
 
 def _transfer_selected(
-    flat: torch.Tensor,
+    flat1d: torch.Tensor,
+    page_stride: int,
     slots: torch.Tensor,
     cols: torch.Tensor,
     packed_cols: torch.Tensor,
@@ -365,8 +403,6 @@ def _transfer_selected(
         return
     page = torch.div(slots, _PAGE_ROWS, rounding_mode="floor").to(torch.int64)
     page_row = torch.remainder(slots, _PAGE_ROWS).to(torch.int64)
-    page_stride = int(flat.stride(0))
-    flat1d = flat.reshape(-1)
     n_rows = slots.shape[0]
     for start in range(0, n_rows, _GATHER_ROW_CHUNK):
         stop = min(start + _GATHER_ROW_CHUNK, n_rows)
@@ -374,7 +410,7 @@ def _transfer_selected(
         page_row_c = page_row[start:stop]
         cols_c = cols[start:stop]
         packed_c = packed_cols[start:stop]
-        offsets = page_c.unsqueeze(1) * page_stride + cols_c
+        offsets = page_c.unsqueeze(1) * int(page_stride) + cols_c
         flat_off = offsets.reshape(-1)
         if not write:
             packed_c.copy_(flat1d[flat_off].reshape_as(packed_c))
@@ -399,9 +435,10 @@ def _write_planar(
 ) -> None:
     _, _, value_bytes, row_bytes = _layout(cache_format)
     scale_bytes = row_bytes - value_bytes
-    flat = _flat_pages(cache, row_bytes)
+    flat1d, page_stride = _cache_flat1d(cache, row_bytes)
     _transfer_selected(
-        flat,
+        flat1d,
+        page_stride,
         slots,
         _column_indexes(slots, value_bytes, 0),
         packed[:, :value_bytes],
@@ -409,7 +446,8 @@ def _write_planar(
         live=live,
     )
     _transfer_selected(
-        flat,
+        flat1d,
+        page_stride,
         slots,
         _column_indexes(slots, scale_bytes, _PAGE_ROWS * value_bytes),
         packed[:, value_bytes:],
@@ -423,26 +461,29 @@ def _read_planar(
 ) -> torch.Tensor:
     """Gather planar value/scale bytes for ``slots``.
 
-    Uses the same chunked page-view ``where`` transfer as scatter. Do not replace
-    this with whole-pool page gathering that materializes ``[N, page_stride]``
-    (~16 GiB at capture-padded N on Ascend).
+    One fused index-gather for value+scale columns (planar layout is not a
+    contiguous row). Do not replace this with whole-pool page gathering that
+    materializes ``[N, page_stride]`` (~16 GiB at capture-padded N on Ascend).
     """
     _, _, value_bytes, row_bytes = _layout(cache_format)
     scale_bytes = row_bytes - value_bytes
-    flat = _flat_pages(cache, row_bytes)
+    flat1d, page_stride = _cache_flat1d(cache, row_bytes)
     packed = cache.new_empty(slots.shape[0], row_bytes)
-    _transfer_selected(
-        flat,
-        slots,
-        _column_indexes(slots, value_bytes, 0),
-        packed[:, :value_bytes],
-        write=False,
+    # Fuse value+scale into one gather: half the Ascend index launches vs two
+    # _transfer_selected reads (gather_global hot path).
+    cols = torch.cat(
+        (
+            _column_indexes(slots, value_bytes, 0),
+            _column_indexes(slots, scale_bytes, _PAGE_ROWS * value_bytes),
+        ),
+        dim=1,
     )
     _transfer_selected(
-        flat,
+        flat1d,
+        page_stride,
         slots,
-        _column_indexes(slots, scale_bytes, _PAGE_ROWS * value_bytes),
-        packed[:, value_bytes:],
+        cols,
+        packed,
         write=False,
     )
     return packed

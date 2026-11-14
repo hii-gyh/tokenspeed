@@ -185,6 +185,64 @@ def test_selected_byte_offsets_stay_int64_past_2gb():
     assert base > 2**31
 
 
+def test_as_flat1d_is_view_over_padded_page_stride():
+    """Ascend OOM'd when reshape(-1) densified a padded page-flat view."""
+    row_bytes = 288
+    pages = 8
+    page_bytes = 64 * row_bytes
+    page_stride = page_bytes + 4096
+    storage = torch.zeros(pages * page_stride, dtype=torch.uint8)
+    cache = storage.as_strided((pages, 64, row_bytes), (page_stride, row_bytes, 1))
+    flat = _mod._flat_pages(cache, row_bytes)
+    flat1d = _mod._as_flat1d(flat)
+    assert flat1d.data_ptr() == flat.data_ptr()
+    assert flat1d.numel() == (pages - 1) * page_stride + page_bytes
+    assert flat1d.stride(0) == 1
+    # Dense reshape would be pages * page_bytes and break padded offsets.
+    assert flat1d.numel() != pages * page_bytes
+
+
+def test_cache_flat1d_dense_uses_contiguous_view():
+    """Dense pools must use cache.view(-1), not the as_strided chain."""
+    row_bytes = 288
+    cache = torch.zeros(4, 64, row_bytes, dtype=torch.uint8)
+    flat1d, page_stride = _mod._cache_flat1d(cache, row_bytes)
+    assert page_stride == 64 * row_bytes
+    assert flat1d.data_ptr() == cache.data_ptr()
+    assert flat1d.is_contiguous()
+    assert flat1d.numel() == cache.numel()
+    assert flat1d.stride(0) == 1
+
+
+def test_cache_flat1d_padded_does_not_densify():
+    row_bytes = 288
+    pages = 8
+    page_bytes = 64 * row_bytes
+    page_stride = page_bytes + 4096
+    storage = torch.zeros(pages * page_stride, dtype=torch.uint8)
+    cache = storage.as_strided((pages, 64, row_bytes), (page_stride, row_bytes, 1))
+    flat1d, stride = _mod._cache_flat1d(cache, row_bytes)
+    assert stride == page_stride
+    assert flat1d.data_ptr() == cache.data_ptr()
+    assert flat1d.numel() == (pages - 1) * page_stride + page_bytes
+
+
+def test_scatter_gather_on_padded_page_stride_roundtrips():
+    fmt, dim, row_bytes = "global", 512, 288
+    pages = 8
+    page_bytes = 64 * row_bytes
+    page_stride = page_bytes + 2048
+    torch.manual_seed(8)
+    rows = torch.randn(3, dim, dtype=torch.bfloat16)
+    storage = torch.full((pages * page_stride,), 0x5A, dtype=torch.uint8)
+    cache = storage.as_strided((pages, 64, row_bytes), (page_stride, row_bytes, 1))
+    slots = torch.tensor([1, 64 + 7, pages * 64 - 2], dtype=torch.int64)
+    _mod.cache_scatter_torch(rows, cache, slots, fmt)
+    got = _mod.cache_gather_torch(cache, slots, fmt, None)
+    expect = _mod.cache_unpack_torch(_mod.cache_pack_torch(rows, fmt, None), fmt, None)
+    assert torch.equal(got, expect)
+
+
 def _soft_f32_to_e4m3fn_u8(x: torch.Tensor) -> torch.Tensor:
     """Mirror of Triton ``_f32_to_e4m3fn_u8`` (Ascend TruncF workaround)."""
     x = torch.nan_to_num(x.float(), nan=0.0, posinf=448.0, neginf=-448.0)
