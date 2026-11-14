@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.dspark_context import (
         DSparkContextProducer,
     )
+    from tokenspeed.runtime.execution.layer_kind_timing import LayerKindTimer
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
@@ -222,7 +223,7 @@ class ForwardContext:
     # Optional decode attribution probe (TOKENSPEED_LOG_LAYER_KIND_TIMING).
     # Carries the active LayerKindTimer so decoder layers can mark attn/MLP
     # sub-phases without process-global state.
-    layer_kind_timer: object | None = None
+    layer_kind_timer: LayerKindTimer | None = None
 
 
 @contextmanager

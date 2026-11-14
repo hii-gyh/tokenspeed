@@ -140,6 +140,10 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
+from tokenspeed.runtime.execution.layer_kind_timing import (
+    LayerKindTimingRecorder,
+    layer_kind_scope,
+)
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41RowPlan,
@@ -2277,14 +2281,15 @@ class DeepseekV41DecoderLayer(nn.Module):
                     self.attn.mapping.attn.head_tp_group,
                 )
             )
-            x = self.attn(
-                positions,
-                x,
-                ctx,
-                reduce_output=not defer_attn,
-                hidden_codes=codes,
-                hidden_scales=scales,
-            )
+            with layer_kind_scope(ctx, "attention", self.layer_id):
+                x = self.attn(
+                    positions,
+                    x,
+                    ctx,
+                    reduce_output=not defer_attn,
+                    hidden_codes=codes,
+                    hidden_scales=scales,
+                )
             attn_pre, post, comb = attn_mixes
             if overlap:
                 for tensor in (attn_pre, post, comb):
@@ -2351,7 +2356,8 @@ class DeepseekV41DecoderLayer(nn.Module):
                         self.hc_eps,
                         self.hc_sinkhorn_iters,
                     )
-            x = self._forward_ffn(x, image_mask, ctx, defer_reduce=defer_moe)
+            with layer_kind_scope(ctx, "ffn", self.layer_id):
+                x = self._forward_ffn(x, image_mask, ctx, defer_reduce=defer_moe)
             ffn_pre, post, comb = ffn_mixes
             if ffn_overlap:
                 for tensor in (ffn_pre, post, comb):
@@ -2670,6 +2676,10 @@ class DeepseekV41Model(nn.Module):
         self.decoder_uses_engram = any(
             layer_id > self.ced_decoder_start for layer_id in config.engram_layer_ids
         )
+        # Event samples are logged by later forwards after non-blocking completion
+        # polls; only DP rank 0's first TP rank allocates timing events.
+        timing_rank = int(mapping.attn.dp_rank != 0 or mapping.attn.tp_rank != 0)
+        self._layer_kind_timing = LayerKindTimingRecorder(rank=timing_rank)
 
     def initialize_engram(self, tokenizer) -> None:
         """Initialize immutable tokenizer/hash constants once; never request history."""
@@ -2732,8 +2742,14 @@ class DeepseekV41Model(nn.Module):
                 None,
             )
         backend = ctx.attn_backend
-        backend.begin_indexer_forward()
+        timer = self._layer_kind_timing.start(
+            self.embed_tokens.weight.device,
+            mode=ctx.forward_mode.name,
+            bs=ctx.bs,
+        )
+        ctx.layer_kind_timer = timer
         try:
+            backend.begin_indexer_forward()
             state = self.encoder_forward(
                 input_ids,
                 positions,
@@ -2749,6 +2765,9 @@ class DeepseekV41Model(nn.Module):
             output = self.finish_forward(hidden, captured, ctx)
         finally:
             self._clear_staged_engram()
+            ctx.layer_kind_timer = None
+            if timer is not None:
+                self._layer_kind_timing.finish(timer)
         backend.end_indexer_forward()
         return output
 
@@ -2768,31 +2787,34 @@ class DeepseekV41Model(nn.Module):
         if layer.engram is not None:
             _sync_fence(f"before_engram_layer_{layer.layer_id}")
             if pending_post is not None:
-                hidden = pending_post.finish(hidden)
+                with layer_kind_scope(ctx, "hc_post", layer.layer_id):
+                    hidden = pending_post.finish(hidden)
                 pending_post = None
-            hidden = layer.engram(
+            with layer_kind_scope(ctx, "engram", layer.layer_id):
+                hidden = layer.engram(
+                    hidden,
+                    state.hashes[:, layer.engram.layer_hash_index],
+                    state.engram_token_mask,
+                    query_shard=(
+                        _row_plan(layer.layer_id, self.ced_decoder_start, ctx).source_shard
+                        if ctx.query_shard is not None
+                        else None
+                    ),
+                )
+        with layer_kind_scope(ctx, "layer", layer.layer_id):
+            hidden, pre_mix, pending_post, tap = layer(
                 hidden,
-                state.hashes[:, layer.engram.layer_hash_index],
-                state.engram_token_mask,
-                query_shard=(
-                    _row_plan(layer.layer_id, self.ced_decoder_start, ctx).source_shard
-                    if ctx.query_shard is not None
-                    else None
-                ),
+                pre_mix,
+                state.positions,
+                state.image_mask,
+                ctx,
+                pending_post=pending_post,
+                # Stage handoffs and Engram require a complete HC stream. Admit
+                # deferred reduction only when the next input can consume it fused.
+                allow_ffn_reduce_fusion=layer.layer_id + 1 < stage_end
+                and self.layers[layer.layer_id + 1].engram is None,
+                capture_input=layer.layer_id in self.dspark_capture_layers,
             )
-        hidden, pre_mix, pending_post, tap = layer(
-            hidden,
-            pre_mix,
-            state.positions,
-            state.image_mask,
-            ctx,
-            pending_post=pending_post,
-            # Stage handoffs and Engram require a complete HC stream. Admit
-            # deferred reduction only when the next input can consume it fused.
-            allow_ffn_reduce_fusion=layer.layer_id + 1 < stage_end
-            and self.layers[layer.layer_id + 1].engram is None,
-            capture_input=layer.layer_id in self.dspark_capture_layers,
-        )
         if tap is not None:
             captured.append(tap)
         return hidden, pre_mix, pending_post
@@ -2887,7 +2909,8 @@ class DeepseekV41Model(nn.Module):
                 raise ValueError(
                     "Engram prepared hashes/mask have the wrong shape or dtype"
                 )
-        self._stage_engram(hashes, self.layers[: self.ced_decoder_start])
+        with layer_kind_scope(ctx, "engram_stage", -1):
+            self._stage_engram(hashes, self.layers[: self.ced_decoder_start])
         h = (
             self.embed_tokens(input_ids, query_shard=ctx.query_shard)
             if input_embeds is None
@@ -2962,7 +2985,8 @@ class DeepseekV41Model(nn.Module):
                 "narrowed row counts exchanged across ranks"
             )
         captured = list(state.captured)
-        self._stage_engram(state.hashes, self.layers[start : start + 1])
+        with layer_kind_scope(ctx, "engram_stage", -1):
+            self._stage_engram(state.hashes, self.layers[start : start + 1])
         # Fused EP exchanges actual local row counts inside its dispatch. The
         # original DP counts remain valid capacity bounds after CED narrowing;
         # no host exchange is needed for its routed or rank-local shared experts.
@@ -3027,7 +3051,8 @@ class DeepseekV41Model(nn.Module):
             )
             return hidden, captured
         ctx.attn_backend.begin_indexer_stage()
-        self._stage_engram(state.hashes, self.layers[start + 1 :])
+        with layer_kind_scope(ctx, "engram_stage", -1):
+            self._stage_engram(state.hashes, self.layers[start + 1 :])
         pending_post = None
         layers = self.layers[start + 1 :]
         if layers:
