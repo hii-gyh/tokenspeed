@@ -44,7 +44,9 @@ assert _spec.loader is not None
 _spec.loader.exec_module(_mod)
 
 
-@pytest.mark.parametrize("fmt,dim,row_bytes", [("index", 128, 68), ("global", 512, 288), ("swa", 512, 528)])
+@pytest.mark.parametrize(
+    "fmt,dim,row_bytes", [("index", 128, 68), ("global", 512, 288), ("swa", 512, 528)]
+)
 def test_pack_unpack_roundtrip_close(fmt, dim, row_bytes):
     torch.manual_seed(0)
     rows = torch.randn(5, dim, dtype=torch.bfloat16)
@@ -54,10 +56,22 @@ def test_pack_unpack_roundtrip_close(fmt, dim, row_bytes):
     assert decoded.dtype == torch.bfloat16
     # Quantization is lossy; require the same sign pattern on large values.
     assert torch.isfinite(decoded).all()
-    corr = torch.corrcoef(torch.stack((rows.float().flatten(), decoded.float().flatten())))[
-        0, 1
-    ]
+    corr = torch.corrcoef(
+        torch.stack((rows.float().flatten(), decoded.float().flatten()))
+    )[0, 1]
     assert corr > 0.95
+
+
+def test_float_to_e4m3_roundtrip_corr_on_cpu():
+    """Bit-level E4M3 encode must stay close enough for SWA KV cache use."""
+    torch.manual_seed(7)
+    values = torch.randn(1024, dtype=torch.float32) * 50
+    values = values.clamp(-448, 448)
+    codes = _mod._float_to_e4m3(values)
+    decoded = _mod._e4m3_to_float(codes)
+    corr = torch.corrcoef(torch.stack((values, decoded)))[0, 1]
+    assert corr > 0.98
+    assert codes.dtype == torch.uint8
 
 
 @pytest.mark.parametrize(
@@ -121,14 +135,18 @@ def test_invalid_slot_does_not_clobber_the_row_it_aliases():
     slots = torch.tensor([63, -1], dtype=torch.int64)
     _mod.cache_scatter_torch(rows, cache, slots, fmt)
     got = _mod.cache_gather_torch(cache, slots[:1], fmt, None)
-    expect = _mod.cache_unpack_torch(_mod.cache_pack_torch(rows[:1], fmt, None), fmt, None)
+    expect = _mod.cache_unpack_torch(
+        _mod.cache_pack_torch(rows[:1], fmt, None), fmt, None
+    )
     assert torch.equal(got, expect)
 
     cache.zero_()
     slots = torch.tensor([-1, 63], dtype=torch.int64)
     _mod.cache_scatter_torch(rows, cache, slots, fmt)
     got = _mod.cache_gather_torch(cache, slots[1:], fmt, None)
-    expect = _mod.cache_unpack_torch(_mod.cache_pack_torch(rows[1:], fmt, None), fmt, None)
+    expect = _mod.cache_unpack_torch(
+        _mod.cache_pack_torch(rows[1:], fmt, None), fmt, None
+    )
     assert torch.equal(got, expect)
 
 
@@ -140,7 +158,9 @@ def test_duplicate_slot_keeps_the_later_row():
     slots = torch.tensor([4, 4], dtype=torch.int64)
     _mod.cache_scatter_torch(rows, cache, slots, fmt)
     got = _mod.cache_gather_torch(cache, slots[:1], fmt, None)
-    expect = _mod.cache_unpack_torch(_mod.cache_pack_torch(rows[1:], fmt, None), fmt, None)
+    expect = _mod.cache_unpack_torch(
+        _mod.cache_pack_torch(rows[1:], fmt, None), fmt, None
+    )
     assert torch.equal(got, expect)
 
 
@@ -163,3 +183,56 @@ def test_selected_byte_offsets_stay_int64_past_2gb():
     assert int(offsets[0, 0]) == base
     assert int(offsets[0, 3]) == base + 3
     assert base > 2**31
+
+
+def _soft_f32_to_e4m3fn_u8(x: torch.Tensor) -> torch.Tensor:
+    """Mirror of Triton ``_f32_to_e4m3fn_u8`` (Ascend TruncF workaround)."""
+    x = torch.nan_to_num(x.float(), nan=0.0, posinf=448.0, neginf=-448.0)
+    x = x.clamp(-448.0, 448.0)
+    bits = x.view(torch.int32)
+    sign = (bits >> 31) & 1
+    abs_bits = bits & 0x7FFFFFFF
+    abs_bits = torch.minimum(
+        abs_bits, torch.full((), 0x43E00000, dtype=torch.int32, device=x.device)
+    )
+    exp = (abs_bits >> 23) & 0xFF
+    mant = abs_bits & 0x7FFFFF
+    mant3 = mant >> 20
+    round_bit = (mant >> 19) & 1
+    sticky = (mant & ((1 << 19) - 1)) != 0
+    incr = (round_bit != 0) & (sticky | ((mant3 & 1) != 0))
+    mant3 = mant3 + incr.to(torch.int32)
+    exp_adj = (mant3 > 7).to(torch.int32)
+    mant3 = mant3 & 7
+    e4_exp = (exp - 120) + exp_adj
+    a = abs_bits.view(torch.float32)
+    scaled = a * (2.0**9)
+    floor = torch.floor(scaled)
+    frac = scaled - floor
+    odd = (floor.to(torch.int32) & 1) != 0
+    rounded = floor + ((frac > 0.5) | ((frac == 0.5) & odd)).to(torch.float32)
+    den_code = torch.where(
+        rounded >= 8,
+        torch.full((), 8, dtype=torch.int32, device=x.device),
+        rounded.to(torch.int32).clamp(0, 7),
+    )
+    is_den = e4_exp <= 0
+    normal_code = ((e4_exp.clamp(1, 15) << 3) | mant3).clamp(0, 0x7E)
+    code = torch.where(is_den, den_code, normal_code)
+    code = torch.where(abs_bits == 0, torch.zeros_like(code), code)
+    code = torch.where(code == 0x7F, torch.full_like(code, 0x7E), code)
+    return ((sign << 7) | code).to(torch.uint8)
+
+
+def test_soft_e4m3_encode_matches_torch_float8_cast():
+    torch.manual_seed(6)
+    vals = torch.cat(
+        [
+            torch.randn(8000) * 100,
+            torch.linspace(-500, 500, 2001),
+            torch.tensor([0.0, 448.0, -448.0, 2**-9, 2**-6, 240.0, 256.0, 288.0]),
+        ]
+    )
+    expect = vals.to(torch.float8_e4m3fn).view(torch.uint8)
+    got = _soft_f32_to_e4m3fn_u8(vals)
+    assert torch.equal(got, expect)

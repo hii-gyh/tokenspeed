@@ -142,7 +142,7 @@ def test_ngram_preparation(bs, max_length, graph, device, uniform):
         torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("device", ["cpu", "cuda", "npu"])
 @pytest.mark.parametrize("graph", [False, True])
 @pytest.mark.parametrize("num_extends", [0, 2, 4])
 @pytest.mark.parametrize("repeat", [1, 1250])
@@ -151,6 +151,13 @@ def test_commit_ngram_independent_reference(graph, num_extends, device, repeat):
 
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
+    if device == "npu":
+        if not hasattr(torch, "npu") or not torch.npu.is_available():
+            pytest.skip("requires Ascend NPU")
+        if graph:
+            pytest.skip("NPU commit uses the host reference, not a device graph")
+        if repeat > 1:
+            pytest.skip("NPU host-commit coverage uses the small batch only")
     if graph and device == "cpu":
         pytest.skip("CUDA graph")
     bs, capacity, pool = 4 * repeat, 10 * repeat, 5 * repeat

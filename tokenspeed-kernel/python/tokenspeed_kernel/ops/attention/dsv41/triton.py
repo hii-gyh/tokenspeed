@@ -52,6 +52,11 @@ _PAGED_FORMATS = {
     "index": {68: "index", 132: "index_v4"},
 }
 _CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}))
+# PIN: Ascend FlatKV stays on torch SPECIALIZED codecs. Triton FlatKV is
+# nvidia/amd-only until single-NPU probes clear dtype/UB overflow on Atlas.
+# (SOFT_E4M3 / uint8-widen experiments remain in the kernels but are not
+# selected on Ascend while ascend is absent from this capability.)
+_FLATKV_CODEC_CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}))
 
 
 def _paged_format(cache, role):
@@ -96,6 +101,8 @@ def _e2m1_encode(x):
 
 @triton.jit
 def _e2m1_decode(code):
+    # Ascend rejects shifts/masks on uint8; widen before bitops.
+    code = code.to(tl.int32)
     a = code & 7
     value = tl.where(
         a < 4,
@@ -138,11 +145,69 @@ def _ue8m0_word(exponent):
 
 
 @triton.jit
-def _global_e4m3_scale(amax):
-    # The global codec rounds its group scales to E4M3, unlike index scales.
-    return (
-        tl.div_rn(tl.maximum(amax, 6 * 2.0**-9), 6.0).to(tl.float8e4nv).to(tl.float32)
+def _e4m3_u8_to_f32(code):
+    """Decode E4M3FN bytes without ``tl.float8e4nv`` (Ascend ExtF/TruncF)."""
+    bits = code.to(tl.int32)
+    sign = (bits >> 7) & 1
+    exponent = (bits >> 3) & 0xF
+    mantissa = bits & 0x7
+    subnormal = mantissa.to(tl.float32) * (2.0**-9)
+    # 2**(exponent-7) via float32 bitcast; Ascend may lack tl.exp2.
+    pow2 = ((exponent - 7 + 127) << 23).to(tl.float32, bitcast=True)
+    normal = (1.0 + mantissa.to(tl.float32) * (1.0 / 8.0)) * pow2
+    value = tl.where(exponent == 0, subnormal, normal)
+    # Cache rows are finite; map the E4M3FN NaN code to zero rather than
+    # materializing a NaN literal Ascend's compiler may reject.
+    value = tl.where((exponent == 0xF) & (mantissa == 0x7), 0.0, value)
+    return tl.where(sign != 0, -value, value)
+
+
+@triton.jit
+def _f32_to_e4m3fn_u8(x):
+    """RTNE float32 -> E4M3FN uint8; bit-exact vs ``torch.float8_e4m3fn``."""
+    x = tl.where(x != x, 0.0, x)
+    x = tl.minimum(tl.maximum(x, -448.0), 448.0)
+    bits = x.to(tl.int32, bitcast=True)
+    sign = (bits >> 31) & 1
+    abs_bits = bits & 0x7FFFFFFF
+    abs_bits = tl.minimum(abs_bits, 0x43E00000)
+    exp = (abs_bits >> 23) & 0xFF
+    mant = abs_bits & 0x7FFFFF
+    mant3 = mant >> 20
+    round_bit = (mant >> 19) & 1
+    sticky = (mant & ((1 << 19) - 1)) != 0
+    incr = (round_bit != 0) & (sticky | ((mant3 & 1) != 0))
+    mant3 = mant3 + incr.to(tl.int32)
+    exp_adj = (mant3 > 7).to(tl.int32)
+    mant3 = mant3 & 7
+    e4_exp = (exp - 120) + exp_adj
+    a = abs_bits.to(tl.float32, bitcast=True)
+    scaled = a * (2.0**9)
+    floor = tl.floor(scaled)
+    frac = scaled - floor
+    odd = (floor.to(tl.int32) & 1) != 0
+    rounded = floor + ((frac > 0.5) | ((frac == 0.5) & odd)).to(tl.float32)
+    den_code = tl.where(
+        rounded >= 8.0,
+        8,
+        tl.minimum(tl.maximum(rounded.to(tl.int32), 0), 7),
     )
+    is_den = e4_exp <= 0
+    normal_code = (tl.minimum(tl.maximum(e4_exp, 1), 15) << 3) | mant3
+    normal_code = tl.minimum(normal_code, 0x7E)
+    code = tl.where(is_den, den_code, normal_code)
+    code = tl.where(abs_bits == 0, 0, code)
+    code = tl.where(code == 0x7F, 0x7E, code)
+    return ((sign << 7) | code).to(tl.uint8)
+
+
+@triton.jit
+def _global_e4m3_scale(amax, SOFT_E4M3: tl.constexpr):
+    # The global codec rounds its group scales to E4M3, unlike index scales.
+    scaled = tl.div_rn(tl.maximum(amax, 6 * 2.0**-9), 6.0)
+    if SOFT_E4M3:
+        return _e4m3_u8_to_f32(_f32_to_e4m3fn_u8(scaled))
+    return scaled.to(tl.float8e4nv).to(tl.float32)
 
 
 @triton.jit
@@ -176,6 +241,9 @@ def _pack_kernel(
     SCALE_BYTES: tl.constexpr,
     FORMAT: tl.constexpr,
     SCATTER: tl.constexpr,
+    # Ascend bishengir rejects TruncF to float8; software E4M3FN matches
+    # torch.float8_e4m3fn bit-exactly and keeps the same cache bytes.
+    SOFT_E4M3: tl.constexpr,
 ):
     # The row reads a caller-sized input, so its offset is 64-bit like the
     # gather's output offset; the cache side is already 64-bit through slot.
@@ -193,8 +261,11 @@ def _pack_kernel(
             # One plain FP32 scale for the whole row; no exponent rounding.
             scale = tl.maximum(amax, 1.0e-6) * (1.0 / 448.0)
         elif FORMAT == "global":
-            scale = _global_e4m3_scale(amax)
-            scale_byte = scale.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+            scale = _global_e4m3_scale(amax, SOFT_E4M3)
+            if SOFT_E4M3:
+                scale_byte = _f32_to_e4m3fn_u8(scale)
+            else:
+                scale_byte = scale.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
         else:
             if FORMAT == "index":
                 scaled_max = tl.maximum(amax, 6 * 2.0**-126) * (1.0 / 6.0)
@@ -217,17 +288,21 @@ def _pack_kernel(
         if FORMAT == "global" or FORMAT == "index":
             codes = _e2m1_encode(y).reshape(D // 2, 2)
             lo, hi = tl.split(codes)
+            # Widen before << / |; Ascend rejects those ops on uint8.
+            packed = (lo.to(tl.int32) | (hi.to(tl.int32) << 4)).to(tl.uint8)
             tl.store(
                 base
                 + _planar_offset(data_byte + tl.arange(0, D // 2), CR, CB, ROW_BYTES),
-                lo | (hi << 4),
+                packed,
             )
         else:
             # QUANTIZED is not a power of two, so the store spans the whole row
             # and masks the RoPE tail off rather than shortening the range.
-            encoded = (
-                tl.clamp(y, -448.0, 448.0).to(tl.float8e4nv).to(tl.uint8, bitcast=True)
-            )
+            clamped = tl.clamp(y, -448.0, 448.0)
+            if SOFT_E4M3:
+                encoded = _f32_to_e4m3fn_u8(clamped)
+            else:
+                encoded = clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
             tl.store(
                 base + _planar_offset(data_byte + d, CR, CB, ROW_BYTES),
                 encoded,
@@ -290,6 +365,7 @@ def _gather_kernel(
     SCALE_BYTES: tl.constexpr,
     FORMAT: tl.constexpr,
     GATHER: tl.constexpr,
+    SOFT_E4M3: tl.constexpr,
 ):
     # A batch's gathered history can pass 2**31 / D output rows (the prefill
     # workspace near a 1M-token context), so the row offset is 64-bit.
@@ -313,7 +389,10 @@ def _gather_kernel(
             base + _planar_offset(scale_byte_offset, CR, CB, ROW_BYTES), valid, other=0
         )
         if FORMAT == "global":
-            scale = scale_byte.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            if SOFT_E4M3:
+                scale = _e4m3_u8_to_f32(scale_byte)
+            else:
+                scale = scale_byte.to(tl.float8e4nv, bitcast=True).to(tl.float32)
         else:
             # E8M0 byte 0 represents 2**-127 (a float32 subnormal).
             scale = tl.where(
@@ -321,7 +400,9 @@ def _gather_kernel(
                 2.0**-127,
                 (scale_byte.to(tl.int32) << 23).to(tl.float32, bitcast=True),
             )
-        value = _e2m1_decode((byte >> ((d % 2) * 4)) & 15) * scale
+        # Widen before >>; Ascend rejects shifts on uint8.
+        nibble = (byte.to(tl.int32) >> ((d % 2) * 4)) & 15
+        value = _e2m1_decode(nibble) * scale
     elif FORMAT == "index_v4":
         byte = tl.load(
             base + _planar_offset(page_row * DATA_BYTES + d, CR, CB, ROW_BYTES),
@@ -342,7 +423,10 @@ def _gather_kernel(
             other=0,
         ).to(tl.int32)
         scale = tl.sum(raw << (b * 8)).to(tl.float32, bitcast=True)
-        value = byte.to(tl.float8e4nv, bitcast=True).to(tl.float32) * scale
+        if SOFT_E4M3:
+            value = _e4m3_u8_to_f32(byte) * scale
+        else:
+            value = byte.to(tl.float8e4nv, bitcast=True).to(tl.float32) * scale
     else:
         quantized = valid & (d < QUANTIZED)
         byte = tl.load(
@@ -360,7 +444,10 @@ def _gather_kernel(
             2.0**-127,
             (scale_byte.to(tl.int32) << 23).to(tl.float32, bitcast=True),
         )
-        value = byte.to(tl.float8e4nv, bitcast=True).to(tl.float32) * scale
+        if SOFT_E4M3:
+            value = _e4m3_u8_to_f32(byte) * scale
+        else:
+            value = byte.to(tl.float8e4nv, bitcast=True).to(tl.float32) * scale
         if ROPE > 0:
             # Halves were stored little-endian; rebuild the BF16 word in place.
             rope = valid & (d >= QUANTIZED)
@@ -399,8 +486,11 @@ def _scale_bytes(cache_format):
 
 
 def _same_device(x, tensors):
-    if not x.is_cuda or any(t.device != x.device for t in tensors if t is not None):
-        raise ValueError("all tensors must share a CUDA/ROCm device")
+    # Triton FlatKV codecs also run on Ascend; is_cuda is false there.
+    if x.device.type not in ("cuda", "npu") or any(
+        t.device != x.device for t in tensors if t is not None
+    ):
+        raise ValueError("all tensors must share a CUDA/ROCm/NPU device")
 
 
 def _integers(x, shape, name):
@@ -462,6 +552,7 @@ def _pack(rows, cache, slots, cache_format):
             SCALE_BYTES=_scale_bytes(cache_format),
             FORMAT=cache_format,
             SCATTER=slots is not None,
+            SOFT_E4M3=rows.device.type == "npu",
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -496,6 +587,7 @@ def _gather(cache, slots, cache_format, out):
             SCALE_BYTES=_scale_bytes(cache_format),
             FORMAT=cache_format,
             GATHER=slots is not None,
+            SOFT_E4M3=cache.device.type == "npu",
             num_warps=4,
         )
     return out
@@ -506,7 +598,7 @@ def _gather(cache, slots, cache_format, out):
     "dsv41_cache_pack",
     name="triton_dsv41_cache_pack",
     solution="triton",
-    capability=_CAPABILITY,
+    capability=_FLATKV_CODEC_CAPABILITY,
     signatures=_FLOAT_SIGNATURES,
     priority=Priority.PORTABLE,
 )
@@ -522,7 +614,7 @@ def cache_pack(rows, cache_format, out):
     "dsv41_cache_unpack",
     name="triton_dsv41_cache_unpack",
     solution="triton",
-    capability=_CAPABILITY,
+    capability=_FLATKV_CODEC_CAPABILITY,
     signatures=_BYTE_SIGNATURES,
     priority=Priority.PORTABLE,
 )
@@ -541,7 +633,7 @@ def cache_unpack(packed, cache_format, out):
     "dsv41_cache_scatter",
     name="triton_dsv41_cache_scatter",
     solution="triton",
-    capability=_CAPABILITY,
+    capability=_FLATKV_CODEC_CAPABILITY,
     signatures=_FLOAT_SIGNATURES,
     priority=Priority.PORTABLE,
 )
@@ -555,7 +647,7 @@ def cache_scatter(rows, cache, slots, cache_format):
     "dsv41_cache_gather",
     name="triton_dsv41_cache_gather",
     solution="triton",
-    capability=_CAPABILITY,
+    capability=_FLATKV_CODEC_CAPABILITY,
     signatures=_BYTE_SIGNATURES,
     priority=Priority.PORTABLE,
 )
@@ -985,7 +1077,7 @@ def _index_scan_kernel(
                 valid[None, :],
                 other=0,
             )
-            value = _e2m1_decode((byte >> ((d[:, None] % 2) * 4)) & 15)
+            value = _e2m1_decode((byte.to(tl.int32) >> ((d[:, None] % 2) * 4)) & 15)
             scale_byte = tl.load(
                 base[None, :]
                 + _planar_offset(

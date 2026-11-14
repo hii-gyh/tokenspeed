@@ -60,8 +60,13 @@ class SiluAndMul(torch.nn.Module):
         if not x.is_cuda:
             if fp8_out:
                 raise NotImplementedError("CPU fp8_out silu_and_mul is not implemented")
-            if x.device.type == "npu" and self.swiglu_limit is None:
-                return silu_and_mul(x)
+            # NPU: always take silu_and_mul. With a checkpoint clamp
+            # (swiglu_limit), the registry selects portable Triton; without
+            # one it selects the Ascend op. Falling through to forward_native
+            # materializes gate/up in fp32 and runs clamp_max/silu as separate
+            # ops — on V4.1 shared experts that dominated decode wall time.
+            if x.device.type == "npu":
+                return silu_and_mul(x, limit=self.swiglu_limit)
             return self.forward_native(x)
 
         if not _is_amd:

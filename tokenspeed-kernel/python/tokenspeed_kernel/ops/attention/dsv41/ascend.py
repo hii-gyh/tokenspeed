@@ -52,7 +52,11 @@ from tokenspeed_kernel.ops.attention.dsv41.pages import (
 )
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature, format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 if current_platform().is_npu:
     from tokenspeed_kernel_npu.ops.dsv41 import (
@@ -254,7 +258,9 @@ if current_platform().is_npu:
                     cmp.kv,
                     cmp.block_table,
                     torch.nn.functional.pad(
-                        cmp.sparse_indices, (0, index_width - cmp.sparse_indices.shape[-1]), value=-1
+                        cmp.sparse_indices,
+                        (0, index_width - cmp.sparse_indices.shape[-1]),
+                        value=-1,
                     ),
                     cmp.topk_length,
                 )
@@ -413,6 +419,8 @@ if current_platform().is_npu:
         """Ascend leaf: write FP32 projections into the 2-row compressor tail."""
         compressor_tail_scatter_torch(content, scores, tail, slots)
 
+    # PIN: Ascend uses torch SPECIALIZED FlatKV codecs; Triton FlatKV stays
+    # nvidia/amd-only until single-NPU dtype/UB probes pass.
     @register_kernel(
         "attention",
         "dsv41_cache_gather",
@@ -533,9 +541,7 @@ if current_platform().is_npu:
         name="ascend_dsv41_selected_attention",
         solution="torch_npu",
         capability=_CAPABILITY,
-        signatures=frozenset(
-            {format_signature(x=dense_tensor_format(torch.bfloat16))}
-        ),
+        signatures=frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))}),
         traits={"flashmla_eligible": frozenset({False})},
         priority=Priority.SPECIALIZED,
         features={"ascend", "flatkv"},
@@ -578,13 +584,17 @@ if current_platform().is_npu:
                 raise ValueError("global cache requires slots and lengths")
             gfmt = {288: "global", 584: "global_v4"}.get(int(global_cache.shape[2]))
             if gfmt != "global":
-                raise NotImplementedError("Ascend selected attention expects v41 global")
+                raise NotImplementedError(
+                    "Ascend selected attention expects v41 global"
+                )
             pieces.append(cache_gather_torch(global_cache, global_slots, gfmt, None))
         keys = torch.cat(pieces, dim=1)  # [T, W, 512]
         tokens, width, _ = keys.shape
-        indices = torch.arange(width, device=q.device, dtype=torch.int32)[None, :].expand(
-            tokens, -1
-        ).contiguous()
+        indices = (
+            torch.arange(width, device=q.device, dtype=torch.int32)[None, :]
+            .expand(tokens, -1)
+            .contiguous()
+        )
         valid = swa_slots >= 0
         if swa_lens is not None:
             cols = torch.arange(swa_slots.shape[-1], device=q.device)
@@ -604,8 +614,8 @@ if current_platform().is_npu:
         )
         scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
         if attn_sink is not None:
-            sink = attn_sink.to(torch.float32).view(1, q.shape[1], 1).expand(
-                tokens, -1, 1
+            sink = (
+                attn_sink.to(torch.float32).view(1, q.shape[1], 1).expand(tokens, -1, 1)
             )
             scores = torch.cat((scores, sink), dim=-1)
         probs = torch.softmax(scores, dim=-1)
@@ -621,4 +631,3 @@ if current_platform().is_npu:
             base = scores[..., :width] if attn_sink is not None else scores
             lse.copy_(torch.logsumexp(base, dim=-1))
         return out
-

@@ -2557,6 +2557,8 @@ class ModelExecutor:
         mrope_ms = 0.0
         sampling_prep_ms = 0.0
         forward_step_ms = 0.0
+        settle_ms = 0.0
+        update_runtime_ms = 0.0
         output_d2h_ms = 0.0
         graph_capable = False
         graph_padded_bs = 0
@@ -2616,7 +2618,8 @@ class ModelExecutor:
 
             def settle() -> None:
                 """What reads the pending round's outputs (see ForwardStepRunner)."""
-                nonlocal grammar_completion, mrope_ms
+                nonlocal grammar_completion, mrope_ms, settle_ms
+                settle_t0 = time.perf_counter() if timing_enabled else 0.0
                 # The previous round's drafts are this forward's inputs.
                 self.complete_pending_drafting()
                 self.input_buffers.load_round_inputs(
@@ -2666,6 +2669,9 @@ class ModelExecutor:
                         grammar_backend=self.config.grammar_backend,
                         output_layout=output_layout,
                     )
+                if timing_enabled:
+                    self.device_module.current_stream().synchronize()
+                    settle_ms += (time.perf_counter() - settle_t0) * 1000.0
 
             if request_history_seeds is not None:
                 self.runtime_states.seed_request_token_history(request_history_seeds)
@@ -2678,8 +2684,8 @@ class ModelExecutor:
                     num_extends,
                 )
             if timing_enabled:
-                input_fill_done = time.perf_counter()
-                input_fill_ms = (input_fill_done - timing_start) * 1000.0
+                self.device_module.current_stream().synchronize()
+                input_fill_ms = (time.perf_counter() - timing_start) * 1000.0
 
             forward_mode = ForwardMode.from_num_extends(num_extends, bs)
 
@@ -2881,6 +2887,15 @@ class ModelExecutor:
                         ) * 1000.0
 
                 # Update runtime state on execution_stream (NOT in the CUDA graph).
+                update_start = time.perf_counter() if timing_enabled else 0.0
+                if timing_enabled:
+                    # Wall-clock decode diagnosis: finish the forward before
+                    # attributing update_runtime_state / D2H time.
+                    self.device_module.current_stream().synchronize()
+                    forward_step_ms = (
+                        time.perf_counter() - forward_step_start
+                    ) * 1000.0
+                    update_start = time.perf_counter()
                 self._update_runtime_state(
                     req_pool_indices=self.input_buffers.state_write_req_pool_indices_buf[
                         :bs
@@ -2891,6 +2906,10 @@ class ModelExecutor:
                     num_extends=num_extends,
                     output_layout=ctx.output_layout,
                 )
+                update_runtime_ms = 0.0
+                if timing_enabled:
+                    self.device_module.current_stream().synchronize()
+                    update_runtime_ms = (time.perf_counter() - update_start) * 1000.0
             with nvtx_range("output_d2h", color="green"):
                 output_d2h_start = time.perf_counter() if timing_enabled else 0.0
                 next_input_ids = None
@@ -2974,7 +2993,11 @@ class ModelExecutor:
                     f"{(time.perf_counter() - timing_start) * 1000.0:.3f} input_fill="
                     f"{input_fill_ms:.3f} "
                     f"mrope={mrope_ms:.3f} sampling={sampling_prep_ms:.3f} "
-                    f"forward_step={forward_step_ms:.3f} output_d2h={output_d2h_ms:.3f}"
+                    f"forward_step={forward_step_ms:.3f} "
+                    f"settle={settle_ms:.3f} "
+                    f"model_fwd={max(forward_step_ms - settle_ms, 0.0):.3f} "
+                    f"update_runtime={update_runtime_ms:.3f} "
+                    f"output_d2h={output_d2h_ms:.3f}"
                     " "
                     f"mode={forward_mode.name!s} bs={bs!s} total_tokens="
                     f"{total_tokens!s} graph={graph_capable!s} padded_bs="

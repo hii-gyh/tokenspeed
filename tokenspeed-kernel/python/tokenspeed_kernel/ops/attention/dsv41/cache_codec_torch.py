@@ -41,6 +41,10 @@ _E2M1_ORDER = (0, 2, 4, 6, 1, 3, 5, 7)
 # E4M3FN NaN encodings are 0x7F and 0xFF. The finite codes are a constant.
 _E4M3_FINITE = tuple(code for code in range(256) if (code & 0x7F) != 0x7F)
 _PAGE_ROWS = 64
+# Bound gather scratch (int64 column indexes + LUT expands). Capture can pad
+# slots far past decode N; processing this many rows at a time keeps peak
+# scratch on the order of tens of MiB instead of GiB.
+_GATHER_ROW_CHUNK = 8192
 _DEVICE_CONSTS: dict[tuple[str, str], torch.Tensor] = {}
 
 
@@ -93,21 +97,60 @@ def _e2m1_decode(nibbles: torch.Tensor) -> torch.Tensor:
     return torch.where((nibbles & 8) != 0, -mag, mag)
 
 
+def _e2m1_pair_table(device: torch.device) -> torch.Tensor:
+    """Map each packed E2M1 byte to float32 ``[lo, hi]`` levels.
+
+    Unpack used to nibble-mask, table-gather, and ``stack`` twice per row; one
+    256-entry LUT replaces that on the gather hot path.
+    """
+
+    def build(dev: torch.device) -> torch.Tensor:
+        codes = torch.arange(256, device=dev, dtype=torch.int32)
+        return torch.stack(
+            (_e2m1_decode(codes & 15), _e2m1_decode((codes >> 4) & 15)),
+            dim=-1,
+        )
+
+    return _device_const("e2m1_pair_table", device, build)
+
+
+def _e4m3_decode_table(device: torch.device) -> torch.Tensor:
+    """Map each E4M3FN code byte to float32.
+
+    Built once per device from ``_e4m3_to_float`` so CUDA keeps the float8 cast
+    path while Ascend pays the bit decode only at warmup.
+    """
+
+    def build(dev: torch.device) -> torch.Tensor:
+        # Ascend rejects ``arange(..., dtype=uint8)``; build as int32 then cast.
+        codes = torch.arange(256, device=dev, dtype=torch.int32).to(torch.uint8)
+        return _e4m3_to_float(codes)
+
+    return _device_const("e4m3_decode_table", device, build)
+
+
 def _e2m1_encode(values: torch.Tensor) -> torch.Tensor:
+    # Eight levels: avoid a broadcast argmin on NPU (same cost class as E4M3).
     levels = _device_const(
         "e2m1_levels",
         values.device,
         lambda device: torch.tensor(_E2M1_LEVELS, device=device, dtype=torch.float32),
     )
-    order = _device_const(
-        "e2m1_order",
+    ax = values.abs().reshape(-1)
+    # searchsorted midpoints → nearest level index in natural order 0..7.
+    # Midpoints between consecutive levels.
+    mids = _device_const(
+        "e2m1_mids",
         values.device,
-        lambda device: torch.tensor(_E2M1_ORDER, device=device),
+        lambda device: 0.5
+        * (
+            torch.tensor(_E2M1_LEVELS, device=device, dtype=torch.float32)[:-1]
+            + torch.tensor(_E2M1_LEVELS, device=device, dtype=torch.float32)[1:]
+        ),
     )
-    distance = (values.abs().unsqueeze(-1) - levels[order]).abs()
-    code = order[distance.argmin(dim=-1)]
-    negative = torch.signbit(values)
-    return (code | (negative.int() << 3)).to(torch.uint8)
+    idx = torch.searchsorted(mids, ax, right=False).clamp(0, 7)
+    negative = torch.signbit(values).reshape(-1)
+    return (idx | (negative.int() << 3)).to(torch.uint8).reshape(values.shape)
 
 
 def _e4m3_to_float(codes: torch.Tensor) -> torch.Tensor:
@@ -137,24 +180,54 @@ def _e4m3_finite(device: torch.device) -> torch.Tensor:
 
 
 def _float_to_e4m3(values: torch.Tensor) -> torch.Tensor:
-    """Encode finite floats as E4M3FN bytes. CUDA uses the float8 cast."""
+    """Encode finite floats as E4M3FN bytes. CUDA uses the float8 cast.
+
+    Non-CUDA (Ascend) uses a bit-level rebias instead of a 240-wide nearest
+    table. Decode SWA scatter was launching that broadcast every layer and
+    dominated attention wall time on NPU.
+    """
     if values.is_cuda:
         return values.to(torch.float8_e4m3fn).view(torch.uint8)
-    finite = _e4m3_finite(values.device)
-    table = _device_const(
-        "e4m3_table",
-        values.device,
-        lambda device: _e4m3_to_float(_e4m3_finite(device).to(torch.uint8)),
+    x = values.float()
+    sign = torch.signbit(x).to(torch.int32) << 7
+    ax = x.abs()
+    # E4M3FN max finite is 448; saturate rather than emit NaN encodings.
+    ax = ax.clamp(max=448.0)
+    bits = ax.view(torch.int32)
+    exp = ((bits >> 23) & 0xFF) - 127
+    mant = bits & 0x7FFFFF
+    # min normal = 2^(1-7) = 2^-6; below that, encode as subnormal.
+    min_normal_exp = 1 - 7
+    is_sub = exp < min_normal_exp
+    # Normal: stored_exp = exp + 7, take top 3 mantissa bits with round-nearest.
+    stored_exp = (exp + 7).clamp(0, 15)
+    # Round: look at bit 19 (0.5 ULP of 3-bit mantissa in the 23-bit field).
+    round_bit = (mant >> 19) & 1
+    sticky = (mant & ((1 << 19) - 1)) != 0
+    mant3 = mant >> 20
+    mant3 = mant3 + torch.where(
+        (round_bit != 0) & (sticky | ((mant3 & 1) != 0)),
+        torch.ones_like(mant3),
+        torch.zeros_like(mant3),
     )
-    odd = _device_const(
-        "e4m3_odd",
-        values.device,
-        lambda device: ((_e4m3_finite(device) & 1) != 0).to(torch.float32),
-    )
-    distance = (values.float().unsqueeze(-1) - table).abs()
-    # Exact midpoints round to the even trailing mantissa bit, matching torch.
-    nearest = (distance + odd * 1e-6).argmin(dim=-1)
-    return finite[nearest].to(torch.uint8)
+    # Mantissa overflow into exponent.
+    exp_carry = mant3 > 7
+    mant3 = torch.where(exp_carry, torch.zeros_like(mant3), mant3)
+    stored_exp = stored_exp + exp_carry.to(stored_exp.dtype)
+    # Subnormals: value = mant_field/8 * 2^-6, round into 3-bit field.
+    # ax / 2^-9 = ax * 512 gives the 3-bit subnormal payload with 0.5 ULPs at
+    # bit weight 2^-9.
+    sub_payload = (ax * (2.0**9)).round().clamp(0, 7).to(torch.int32)
+    out_exp = torch.where(is_sub, torch.zeros_like(stored_exp), stored_exp)
+    out_mant = torch.where(is_sub, sub_payload, mant3.clamp(0, 7))
+    # Clamp exp overflow from rounding into the finite max code (0x7E).
+    overflow = out_exp >= 15
+    out_exp = torch.where(overflow, torch.full_like(out_exp, 14), out_exp)
+    out_mant = torch.where(overflow, torch.full_like(out_mant, 7), out_mant)
+    zero = ax == 0
+    code = (out_exp << 3) | out_mant
+    code = torch.where(zero, torch.zeros_like(code), code)
+    return (sign | code).to(torch.uint8)
 
 
 def _pack_rows(rows: torch.Tensor, cache_format: str) -> torch.Tensor:
@@ -165,7 +238,7 @@ def _pack_rows(rows: torch.Tensor, cache_format: str) -> torch.Tensor:
     if cache_format == "global":
         scale = _float_to_e4m3(amax.clamp_min(6 * 2.0**-9) / 6)
         scale_bytes = scale if scale.dtype == torch.uint8 else scale.view(torch.uint8)
-        scale_f = _e4m3_to_float(scale_bytes)
+        scale_f = _e4m3_decode_table(rows.device)[scale_bytes.long()]
     else:
         swa = cache_format == "swa"
         scaled = amax.clamp_min(1e-4 if swa else 6 * 2.0**-126)
@@ -181,20 +254,24 @@ def _pack_rows(rows: torch.Tensor, cache_format: str) -> torch.Tensor:
     else:
         codes = _e2m1_encode(normalized.reshape(-1, dim)).reshape(-1, dim // 2, 2)
         values = codes[..., 0] | (codes[..., 1] << 4)
-    packed = torch.empty(rows.shape[0], row_bytes, dtype=torch.uint8, device=rows.device)
+    packed = torch.empty(
+        rows.shape[0], row_bytes, dtype=torch.uint8, device=rows.device
+    )
     packed[:, :value_bytes] = values
     packed[:, value_bytes:] = scale_bytes.flatten(1)
     return packed
 
 
-def _unpack_rows(packed: torch.Tensor, cache_format: str, dtype: torch.dtype) -> torch.Tensor:
+def _unpack_rows(
+    packed: torch.Tensor, cache_format: str, dtype: torch.dtype
+) -> torch.Tensor:
     dim, group, value_bytes, row_bytes = _layout(cache_format)
     if packed.shape[-1] != row_bytes:
         raise ValueError(f"packed rows must be {row_bytes} bytes")
     values = packed[..., :value_bytes]
     scale_u8 = packed[..., value_bytes:]
     if cache_format == "global":
-        scale = _e4m3_to_float(scale_u8)
+        scale = _e4m3_decode_table(packed.device)[scale_u8.long()]
     else:
         scale = torch.where(
             scale_u8 == 0,
@@ -203,11 +280,14 @@ def _unpack_rows(packed: torch.Tensor, cache_format: str, dtype: torch.dtype) ->
         )
     scale = scale.reshape(*packed.shape[:-1], dim // group)
     if cache_format == "swa":
-        decoded = _e4m3_to_float(values).reshape(*scale.shape, group)
+        decoded = _e4m3_decode_table(packed.device)[values.long()].reshape(
+            *scale.shape, group
+        )
     else:
-        lo = _e2m1_decode(values & 15)
-        hi = _e2m1_decode((values >> 4) & 15)
-        decoded = torch.stack((lo, hi), dim=-1).reshape(*scale.shape, group)
+        # One LUT gather yields both E2M1 nibbles; avoids mask/stack on NPU.
+        decoded = _e2m1_pair_table(packed.device)[values.long()].reshape(
+            *scale.shape, group
+        )
     return (decoded * scale.unsqueeze(-1)).reshape(*packed.shape[:-1], dim).to(dtype)
 
 
@@ -226,20 +306,11 @@ def _selected_byte_offsets(
 
 def _column_indexes(slots: torch.Tensor, width: int, origin: int) -> torch.Tensor:
     page_row = (slots % _PAGE_ROWS).to(torch.int64).unsqueeze(1)
-    return origin + page_row * width + torch.arange(
-        width, device=slots.device, dtype=torch.int64
+    return (
+        origin
+        + page_row * width
+        + torch.arange(width, device=slots.device, dtype=torch.int64)
     )
-
-
-def _chunk_pages(page_stride: int) -> int:
-    """Pages addressed inside one signed 32-bit byte offset.
-
-    A real KV pool passes 2 GiB. Indexing ``page * stride + col`` across that
-    pool is rejected. A slice of this many pages keeps the in-slice offset
-    inside int32; the slice base itself is a Python integer.
-    """
-    stride = max(int(page_stride), 1)
-    return max(1, (2**31 - 1) // stride)
 
 
 def _winning_values(
@@ -283,33 +354,40 @@ def _transfer_selected(
     write: bool,
     live: torch.Tensor | None = None,
 ) -> None:
-    """Copy selected columns in fixed page chunks.
+    """Copy selected columns through int64 byte offsets into the page-flat view.
 
-    The chunk count comes from the pool shape, not from the slot values, so a
-    captured replay still follows the slot tensor. ``live`` rows outside a
-    chunk put the bytes they read back; inactive rows therefore do not need a
-    host-side mask.
+    Ascend ``view[page, cols]`` materializes ``[N, page_stride]`` (multi-GiB at
+    capture-padded N). Indexing a 1-D view by ``page * stride + col`` only
+    touches the selected bytes. Slot rows are chunked so offset scratch stays
+    bounded; iteration count follows the static slot shape for graph capture.
     """
     if slots.numel() == 0:
         return
-    page = torch.div(slots, _PAGE_ROWS, rounding_mode="floor")
-    page_row = torch.remainder(slots, _PAGE_ROWS)
+    page = torch.div(slots, _PAGE_ROWS, rounding_mode="floor").to(torch.int64)
+    page_row = torch.remainder(slots, _PAGE_ROWS).to(torch.int64)
     page_stride = int(flat.stride(0))
-    chunk_pages = _chunk_pages(page_stride)
-    for start in range(0, flat.shape[0], chunk_pages):
-        stop = min(start + chunk_pages, flat.shape[0])
-        view = flat[start:stop]
-        in_chunk = (page >= start) & (page < stop)
-        if live is not None:
-            in_chunk = live & in_chunk
-        local = (page - start).clamp(0, stop - start - 1)
-        taken = view[local.unsqueeze(1), cols]
+    flat1d = flat.reshape(-1)
+    n_rows = slots.shape[0]
+    for start in range(0, n_rows, _GATHER_ROW_CHUNK):
+        stop = min(start + _GATHER_ROW_CHUNK, n_rows)
+        page_c = page[start:stop]
+        page_row_c = page_row[start:stop]
+        cols_c = cols[start:stop]
+        packed_c = packed_cols[start:stop]
+        offsets = page_c.unsqueeze(1) * page_stride + cols_c
+        flat_off = offsets.reshape(-1)
         if not write:
-            packed_cols.copy_(torch.where(in_chunk.unsqueeze(1), taken, packed_cols))
+            packed_c.copy_(flat1d[flat_off].reshape_as(packed_c))
             continue
-        payload = torch.where(in_chunk.unsqueeze(1), packed_cols, taken)
-        key = local.to(torch.int64) * _PAGE_ROWS + page_row.to(torch.int64)
-        view[local.unsqueeze(1), cols] = _winning_values(key, in_chunk, payload)
+        taken = flat1d[flat_off].reshape_as(packed_c)
+        active = (
+            live[start:stop]
+            if live is not None
+            else torch.ones(stop - start, dtype=torch.bool, device=slots.device)
+        )
+        payload = torch.where(active.unsqueeze(1), packed_c, taken)
+        key = page_c * _PAGE_ROWS + page_row_c
+        flat1d[flat_off] = _winning_values(key, active, payload).reshape(-1)
 
 
 def _write_planar(
@@ -340,7 +418,15 @@ def _write_planar(
     )
 
 
-def _read_planar(cache: torch.Tensor, slots: torch.Tensor, cache_format: str) -> torch.Tensor:
+def _read_planar(
+    cache: torch.Tensor, slots: torch.Tensor, cache_format: str
+) -> torch.Tensor:
+    """Gather planar value/scale bytes for ``slots``.
+
+    Uses the same chunked page-view ``where`` transfer as scatter. Do not replace
+    this with whole-pool page gathering that materializes ``[N, page_stride]``
+    (~16 GiB at capture-padded N on Ascend).
+    """
     _, _, value_bytes, row_bytes = _layout(cache_format)
     scale_bytes = row_bytes - value_bytes
     flat = _flat_pages(cache, row_bytes)
@@ -382,12 +468,17 @@ def cache_gather_torch(
     if flat_slots.numel() == 0:
         return out
     capacity = cache.shape[0] * _PAGE_ROWS
-    valid = (flat_slots >= 0) & (flat_slots < capacity)
-    safe = flat_slots.clamp(0, max(capacity - 1, 0))
-    packed = _read_planar(cache, safe, cache_format)
-    decoded = _unpack_rows(packed, cache_format, dtype)
-    decoded = decoded.masked_fill(~valid[:, None], 0)
-    out.view(-1, dim).copy_(decoded)
+    capacity_last = max(capacity - 1, 0)
+    out_flat = out.view(-1, dim)
+    # Chunk so E2M1/E4M3 LUT expands stay bounded at capture-padded slot counts.
+    n_rows = flat_slots.shape[0]
+    for start in range(0, n_rows, _GATHER_ROW_CHUNK):
+        stop = min(start + _GATHER_ROW_CHUNK, n_rows)
+        chunk = flat_slots[start:stop]
+        valid = (chunk >= 0) & (chunk < capacity)
+        packed = _read_planar(cache, chunk.clamp(0, capacity_last), cache_format)
+        decoded = _unpack_rows(packed, cache_format, dtype)
+        out_flat[start:stop] = decoded.masked_fill(~valid[:, None], 0)
     return out
 
 
@@ -399,9 +490,14 @@ def cache_scatter_torch(
 ) -> None:
     """Quantize BF16/FP32 rows into page-planar uint8 slots."""
     dim, _, _, _ = _layout(cache_format)
-    if rows.ndim != 2 or rows.shape[1] != dim or rows.dtype not in (
-        torch.bfloat16,
-        torch.float32,
+    if (
+        rows.ndim != 2
+        or rows.shape[1] != dim
+        or rows.dtype
+        not in (
+            torch.bfloat16,
+            torch.float32,
+        )
     ):
         raise ValueError(f"rows must be BF16/FP32 [N, {dim}]")
     if slots.shape != (rows.shape[0],) or slots.dtype not in (torch.int32, torch.int64):
