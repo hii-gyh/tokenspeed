@@ -501,6 +501,45 @@ per occupied card, leaving only two apparent free cards. There is therefore no
 ready independent 16-card co-resident pool for a second world-size-16 service in
 the current snapshot.
 
+## 2026-11-16 evening: 427 TS A/B and fresh vLLM 420 alternating baseline
+
+The TS 427 service carrying the pending prefill SWA mirror candidate was
+measured after release and stop. Its five-round fixed-load stream results are
+`outputs/v41-debug/20261116T182409Z-427-cluster2/427-benchmark.json`:
+throughput mean 27.9932 tok/s, median 28.0384, min 27.4491, max 28.3796; TTFT
+p50 2.6493s, p90 2.7301s; TPOT mean 0.266165s, p50 0.266001s, p90 0.267497s.
+Relative to the clean 480 TS snapshot this is a small TS-side change
+(throughput 1.0703x, TPOT 0.9709x, TTFT p50 0.7871x), but it is **not** a
+paired kernel attribution and cannot be claimed as proof that the mirror
+candidate caused the improvement. 427's strict fixed-prompt gate remains
+`gate_passed=false` (`paris`, `count`, `chinese`).
+
+After releasing TS, fresh vLLM-Ascend Graph run `20261116T191538Z-420` was
+brought up on the same two-node footprint; both containers are Up, rank0
+`/health` returns 200, and `/v1/models` returns `deepseek-v41`. The built-in
+Paris smoke returned degenerate text and stopped before the built-in measured
+rounds. A temporary performance-only driver retained five measured rounds in
+`420-benchmark-nogate.json`; this does not close the text gate. The five-round
+vLLM results are throughput mean 209.5961 tok/s, median 204.8606, min
+203.8177, max 220.8404; TTFT p50 0.8122s, p90 1.1703s; TPOT mean 0.031887s,
+p50 0.031033s, p90 0.035924s. The 420 strict gate also fails
+(`paris`, `count`, `chinese`).
+
+The alternating 427-vs-420 comparison is
+`outputs/v41-debug/20261116T191538Z-420-vs-427-comparison.json`. TS throughput
+is 0.13356x vLLM (vLLM 7.4874x TS), TS TPOT mean is 8.3470x vLLM, and TS
+TTFT p50 is 3.2617x vLLM. Under the rough 127-token post-prefill decomposition,
+decode/TPOT excess is 29.7533s and TTFT excess is 1.8370s per batch, so
+94.18% of the rough request-level excess remains in the decode/逐 token path;
+TTFT/prefill is still a real gap but smaller in this fixed-load estimate.
+These are mixed/decode-dominated short-context stream numbers, not paired pure
+prefill or pure decode kernel ledgers.
+
+420 occupies about 60.4 GB of the 65.5 GB HBM on each rank0 card, leaving
+roughly 5.1 GB free. Together with the prior per-service 56-60 GB measurement,
+a second world-size-16 same-spec service still cannot be co-resident on this
+16-card footprint; the accepted comparison remains alternating residency.
+
 ## Key files
 
 | Area | Path |
@@ -533,16 +572,17 @@ Cursor agent conversation under project `tokenspeed`; Phase C / B2 agents id `70
 
 ## One-sentence status
 
-**Current status: vLLM-Ascend 431 is Up and healthy on the alternating 16-card
-footprint and returned a short 4-token smoke completion; TS 481 is stopped with
-HBM released. The fair baseline still shows TS at about 0.122x vLLM throughput
-(26.155 vs 214.398 output tokens/s), 8.63x TPOT (0.2741 vs 0.0318 s), and
-4.41x TTFT p50 (3.366 vs 0.763 s). Rough request-level excess remains
-decode-dominant (~92.20%). The controlled TS rank0 prefill evidence is partial,
-and the paired TS/vLLM prefill/decode ledger remains open. The paired text gate
-shows vLLM reference is only partial-pass while TS is materially more
-degenerate; the local review flags BF16-mirror synchronization and MoE `ctx`
-propagation as unproven suspects, not closed root causes. Priority order: close
-or isolate the fresh text gate, build paired decode/prefill ledgers, rank and
+**Current status: vLLM-Ascend 420 is Up on the alternating 16-card footprint;
+TS 427 is stopped with evidence retained. Fresh alternating five-round results
+still show TS at 0.13356x vLLM throughput (27.993 vs 209.596 tok/s), 8.3470x
+TPOT (0.2662 vs 0.0319s), and 3.2617x TTFT p50 (2.649 vs 0.812s). Rough
+request-level excess remains decode-dominant (~94.18%). Both sides fail the
+strict fixed-prompt gate; the 420 vLLM smoke failure is retained separately
+from the temporary performance-only five-round collection. The controlled TS
+rank0 prefill evidence is partial, and the paired TS/vLLM prefill/decode
+ledger remains open. BF16-mirror synchronization and MoE `ctx` propagation
+remain unproven suspects, not closed root causes. Priority order: close or
+isolate the fresh text gate, validate the mirror candidate only after
+tensor/Graph consistency checks, build paired decode/prefill ledgers, rank and
 validate backend fixes, then resume PD only after the aggregate path is
 competitive.**
