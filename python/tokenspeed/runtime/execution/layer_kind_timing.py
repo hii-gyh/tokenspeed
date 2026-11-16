@@ -113,9 +113,7 @@ class LayerKindTimer:
         if not self._end.query():
             return None
         kinds: dict[str, float] = defaultdict(float)
-        layers: dict[int, dict[str, float]] = defaultdict(
-            lambda: defaultdict(float)
-        )
+        layers: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
         for scope in self._scopes:
             elapsed = float(scope.start.elapsed_time(scope.end))
             kinds[scope.kind] += elapsed

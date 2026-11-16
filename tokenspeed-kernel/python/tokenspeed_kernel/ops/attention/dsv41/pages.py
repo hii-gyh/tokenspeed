@@ -74,9 +74,7 @@ def as_pa_bbnd(cache: torch.Tensor) -> torch.Tensor:
     Accepts ``[P, R, 512]`` or ``[P, R, 1, 512]``. Does not copy.
     """
     if cache.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(
-            f"PA_BBND view requires BF16/FP16 cache, got {cache.dtype}"
-        )
+        raise ValueError(f"PA_BBND view requires BF16/FP16 cache, got {cache.dtype}")
     if cache.ndim == 4:
         if cache.shape[2:] != (1, HEAD_DIM):
             raise ValueError(
@@ -139,7 +137,9 @@ def compact_selection_indices(
     device = lengths.device
     columns = torch.arange(width, device=device, dtype=torch.int32)
     valid = columns[None, :] < lengths.to(torch.int32)[:, None]
-    indices = torch.where(valid, columns[None, :], torch.full((), -1, dtype=torch.int32, device=device))
+    indices = torch.where(
+        valid, columns[None, :], torch.full((), -1, dtype=torch.int32, device=device)
+    )
     topk_length = lengths.to(dtype=torch.int32).clamp(0, width).view(tokens, 1)
     return indices.unsqueeze(1).contiguous(), topk_length.contiguous()
 
@@ -451,14 +451,14 @@ def adapt_flatkv_decode_selections(
         if cmp_ratio not in (0,):
             # SWA-only layers pass ratio 0; compressed layers must supply rows.
             if cmp_ratio in (1, 2):
-                raise ValueError(
-                    f"cmp_ratio={cmp_ratio} requires gathered global_rows"
-                )
+                raise ValueError(f"cmp_ratio={cmp_ratio} requires gathered global_rows")
         return ori, None, None
     if global_lens is None:
         raise ValueError("global_rows requires global_lens")
     if cmp_ratio not in (1, 2):
-        raise ValueError(f"compressed global KV requires cmp_ratio 1 or 2, got {cmp_ratio}")
+        raise ValueError(
+            f"compressed global KV requires cmp_ratio 1 or 2, got {cmp_ratio}"
+        )
     cmp = materialize_bf16_rows_as_pa_bbnd(global_rows, global_lens)
     residual = cmp_residual_kv(seq_lens, cmp_ratio)
     return ori, cmp, residual

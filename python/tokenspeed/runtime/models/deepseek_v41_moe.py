@@ -262,10 +262,10 @@ class DeepseekV4MoE(nn.Module):
                     "DeepSeek V4 normal EP does not support redundant experts "
                     "with precomputed routing."
                 )
-            if (
-                mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size)
-                and not mapping_uses_wide_ep(mapping)
-            ):
+            if mapping.attn.tp_size not in (
+                1,
+                mapping.moe.tp_ep_size,
+            ) and not mapping_uses_wide_ep(mapping):
                 raise ValueError(
                     "DeepSeek V4 normal EP requires attention TP size 1 or "
                     "attention TP size equal to the MoE TPxEP size, unless "

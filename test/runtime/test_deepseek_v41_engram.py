@@ -249,8 +249,10 @@ def test_int8_group32_dequant_matches_symmetric_reference():
     scales = torch.randn(3, 2, dtype=torch.float32).abs() + 1e-3
     actual = _dequant_int8_group32(codes, scales)
     expected = (
-        codes.float().unflatten(-1, (-1, 32)) * scales.unsqueeze(-1)
-    ).flatten(-2).bfloat16()
+        (codes.float().unflatten(-1, (-1, 32)) * scales.unsqueeze(-1))
+        .flatten(-2)
+        .bfloat16()
+    )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
@@ -1161,6 +1163,7 @@ def test_host_load_barrier_uses_the_cpu_group(monkeypatch):
     monkeypatch.setattr(
         pg_manager, "has_process_group", lambda backend, group: backend == "gloo"
     )
+
     def get_process_group(backend, group):
         seen["group"] = (backend, group)
         return "cpu-group"

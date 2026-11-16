@@ -632,9 +632,7 @@ def _norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
 def _attention_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
     # Ratio-1 compressor and attention projections use the platform RMSNorm
     # (Ascend ``npu_rms_norm`` via the layernorm registry on NPU).
-    return (
-        norm(x, residual=None, out=None) if _on_accelerator(x) else _norm(x, norm)
-    )
+    return norm(x, residual=None, out=None) if _on_accelerator(x) else _norm(x, norm)
 
 
 def _merged(input_size, output_sizes, dtype, quant_config, prefix):
@@ -1950,9 +1948,7 @@ class DeepseekV41MoE(DeepseekV4MoE):
         # Text-only (or no image rows): keep the base gate / hash-MoE path on
         # CUDA and Ascend. ``is_cuda`` alone left NPU on the vision fork that
         # drops ``tid2eid`` / ``input_ids``.
-        if _on_accelerator(hidden_states) and (
-            bias_vl is None or image_mask is None
-        ):
+        if _on_accelerator(hidden_states) and (bias_vl is None or image_mask is None):
             return super()._routing_inputs(hidden_states, None)
         bias = self.gate.e_score_correction_bias
         if bias_vl is not None and image_mask is not None:
@@ -2796,7 +2792,9 @@ class DeepseekV41Model(nn.Module):
                     state.hashes[:, layer.engram.layer_hash_index],
                     state.engram_token_mask,
                     query_shard=(
-                        _row_plan(layer.layer_id, self.ced_decoder_start, ctx).source_shard
+                        _row_plan(
+                            layer.layer_id, self.ced_decoder_start, ctx
+                        ).source_shard
                         if ctx.query_shard is not None
                         else None
                     ),

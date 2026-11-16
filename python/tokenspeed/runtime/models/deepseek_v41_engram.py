@@ -859,9 +859,7 @@ class RowShardedEngramEmbedding(nn.Module):
         elif self.host_table and self.weight_dtype == torch.int8:
             # The INT8 table stays on CPU. Resolve ids on the CPU as well:
             # the NPU cannot run the int64 range check.
-            table_ids, valid = _host_int8_row_ids(
-                indices, self.row_start, self.row_end
-            )
+            table_ids, valid = _host_int8_row_ids(indices, self.row_start, self.row_end)
             codes = self.weight[table_ids]
             scales = self.scale[table_ids]
             if codes.device != target:
@@ -1056,8 +1054,7 @@ class DeepseekV41Engram(nn.Module):
             or block.shape[0] != _ENGRAM_SCALE_GROUP
         ):
             raise ValueError(
-                "Engram rotation_block must be [32, 32]; "
-                f"got {tuple(block.shape)}"
+                "Engram rotation_block must be [32, 32]; " f"got {tuple(block.shape)}"
             )
         self.rotation_block = block.detach().float().contiguous()
         self._rotation_on_device = None
@@ -1070,8 +1067,10 @@ class DeepseekV41Engram(nn.Module):
         cached = self._rotation_on_device
         if cached is not None and cached.device == device:
             return cached
-        cached = block if block.device == device else block.to(
-            device=device, dtype=torch.float32
+        cached = (
+            block
+            if block.device == device
+            else block.to(device=device, dtype=torch.float32)
         )
         self._rotation_on_device = cached
         return cached
@@ -1180,9 +1179,9 @@ class DeepseekV41Engram(nn.Module):
         original = h
         if self.rotation_block is not None:
             block = self._rotation_matrix(h.device)
-            original = (
-                original.unflatten(-1, (-1, block.shape[0])) @ block.T
-            ).flatten(-2)
+            original = (original.unflatten(-1, (-1, block.shape[0])) @ block.T).flatten(
+                -2
+            )
         weight = self.q_weight.float() * self.k_weight.float()
         rstd = torch.rsqrt(original.square().mean(-1) + self.eps) * torch.rsqrt(
             key.square().mean(-1) + self.eps

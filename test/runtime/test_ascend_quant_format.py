@@ -141,9 +141,7 @@ def test_v41_fused_attn_lookup_uses_bare_layers_shards():
             "layers.1.engram.wkv.weight": "FLOAT",
         }
     )
-    assert (
-        fmt.lookup_kind(kinds, "model.layers.0.attn.wq_a_wkv") == "W8A8_DYNAMIC"
-    )
+    assert fmt.lookup_kind(kinds, "model.layers.0.attn.wq_a_wkv") == "W8A8_DYNAMIC"
     assert (
         fmt.lookup_kind(kinds, "model.layers.2.attn.compressor.wkv_wgate")
         == "W8A8_DYNAMIC"
@@ -270,9 +268,7 @@ def test_v41_dense_quant_passes_through_ascend_w8a8():
     from tokenspeed.runtime.layers.quantization.ascend import AscendQuantConfig
     from tokenspeed.runtime.models.deepseek_v41 import v41_dense_quant
 
-    config = AscendQuantConfig.from_config(
-        {"model.layers.0.attn.wq_b.weight": "W8A8"}
-    )
+    config = AscendQuantConfig.from_config({"model.layers.0.attn.wq_b.weight": "W8A8"})
     assert v41_dense_quant(config) is config
     assert v41_dense_quant(None) is None
 

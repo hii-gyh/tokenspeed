@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import pytest
-
 from tokenspeed_kernel.ops.attention.dsv41 import triton as dsv41_triton
 
 

@@ -70,11 +70,15 @@ def test_index_topk_picks_matching_key():
     # Query aligned with that key; one head.
     q = key.view(1, 1, 128).expand(1, 2, 128).contiguous()
     weights = torch.ones(1, 2, dtype=torch.bfloat16)
-    table = torch.tensor([[1, 0]], dtype=torch.int32)  # page id 1 is unused; page 0 → need page id > 0
+    table = torch.tensor(
+        [[1, 0]], dtype=torch.int32
+    )  # page id 1 is unused; page 0 → need page id > 0
     # Page table stores page ids; slot 3 lives in page 0. Use page id 1 for column 0
     # by placing the key at slot 64+3 on page 1 instead.
     cache2 = torch.zeros(3, 64, 68, dtype=torch.uint8)
-    codec.cache_scatter_torch(key, cache2, torch.tensor([64 + 3], dtype=torch.int64), "index")
+    codec.cache_scatter_torch(
+        key, cache2, torch.tensor([64 + 3], dtype=torch.int64), "index"
+    )
     table = torch.tensor([[1]], dtype=torch.int32)
     visible = torch.tensor([8], dtype=torch.int32)
     rows, lens, blocks, block_lens = indexer.index_topk_torch(
@@ -124,7 +128,9 @@ def test_candidate_blocks_match_the_host_loop():
     )
     lengths = torch.tensor([4, 5, 1, 0], dtype=torch.int32)
     visible = torch.tensor([20, 8, 0, 1], dtype=torch.int32)
-    got_blocks, got_lens = indexer._candidate_blocks_from_rows(rows, lengths, visible, 2, 8)
+    got_blocks, got_lens = indexer._candidate_blocks_from_rows(
+        rows, lengths, visible, 2, 8
+    )
     exp_blocks, exp_lens = _reference_blocks(rows, lengths, visible, 2, 8)
     assert torch.equal(got_blocks, exp_blocks)
     assert torch.equal(got_lens, exp_lens)

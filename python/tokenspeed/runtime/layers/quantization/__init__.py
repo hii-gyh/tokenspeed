@@ -18,11 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from tokenspeed.runtime.layers.quantization.ascend import AscendQuantConfig
 from tokenspeed.runtime.layers.quantization.base_config import (  # noqa: F401
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from tokenspeed.runtime.layers.quantization.ascend import AscendQuantConfig
 from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )

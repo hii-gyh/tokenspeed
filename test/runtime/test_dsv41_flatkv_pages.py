@@ -194,9 +194,7 @@ def test_pad_and_compact_helpers():
 
 def test_prefill_workspace_matches_the_dense_key_set():
     kv = torch.randn(6, HEAD_DIM, dtype=torch.bfloat16)
-    indices = torch.tensor(
-        [[0, -1, 2, 4, -1], [1, -1, -1, -1, -1]], dtype=torch.int32
-    )
+    indices = torch.tensor([[0, -1, 2, 4, -1], [1, -1, -1, -1, -1]], dtype=torch.int32)
     seq_lens = torch.tensor([8, 9], dtype=torch.int32)
     ori, cmp, residual = _pages.prefill_workspace_selections(
         kv, indices, 3, 2, seq_lens

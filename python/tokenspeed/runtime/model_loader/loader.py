@@ -44,12 +44,12 @@ from tokenspeed.runtime.configs.device_config import DeviceConfig
 from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.quantization.ascend_format import (
+    weights_index_filename,
+)
 from tokenspeed.runtime.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
-)
-from tokenspeed.runtime.layers.quantization.ascend_format import (
-    weights_index_filename,
 )
 from tokenspeed.runtime.model_loader.utils import (
     get_model_architecture,

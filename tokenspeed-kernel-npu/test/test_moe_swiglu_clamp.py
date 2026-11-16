@@ -23,7 +23,6 @@ from __future__ import annotations
 import pytest
 import torch
 import torch_npu
-
 from tokenspeed_kernel_npu.ops.moe import (
     _ascend_int8_dequant_swiglu_quant,
     _expand_expert_scales,

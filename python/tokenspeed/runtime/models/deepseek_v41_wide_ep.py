@@ -338,7 +338,9 @@ def apply_wide_ep_rowwise(
     the original batch, not one dispatch per attention-TP rank.
     """
     if hidden.ndim != 2:
-        raise ValueError(f"MoE hidden must be [tokens, hidden], got {tuple(hidden.shape)}")
+        raise ValueError(
+            f"MoE hidden must be [tokens, hidden], got {tuple(hidden.shape)}"
+        )
     if tp_size == 1:
         output = forward_rows(hidden)
     else:

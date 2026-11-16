@@ -25,10 +25,10 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention.dsv41.cache_codec_torch import (
+    _e2m1_decode,
     _e2m1_pair_table,
     _e4m3_decode_table,
     _e4m3_to_float,
-    _e2m1_decode,
     cache_gather_torch,
     cache_pack_torch,
     cache_scatter_torch,

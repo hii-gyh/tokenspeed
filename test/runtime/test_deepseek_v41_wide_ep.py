@@ -97,7 +97,9 @@ def test_dp4_tp8_ep32_owns_each_expert_once():
         assert mapping.attn.tp_size == _ATTN_TP
         assert mapping.attn.dp_size == _ATTN_DP
         assert mapping.attn.tp_group == tuple(
-            range((rank // _ATTN_TP) * _ATTN_TP, (rank // _ATTN_TP) * _ATTN_TP + _ATTN_TP)
+            range(
+                (rank // _ATTN_TP) * _ATTN_TP, (rank // _ATTN_TP) * _ATTN_TP + _ATTN_TP
+            )
         )
         assert mapping.moe.tp_size == 1
         assert mapping.moe.ep_size == _EP
@@ -135,7 +137,9 @@ def test_wide_ep_is_not_the_matched_attention_group():
 def test_replicated_token_split_round_trips():
     tokens = 32
     hidden = torch.arange(tokens * 6, dtype=torch.bfloat16).reshape(tokens, 6)
-    parts = [split_replicated_tokens(hidden, rank, _ATTN_TP) for rank in range(_ATTN_TP)]
+    parts = [
+        split_replicated_tokens(hidden, rank, _ATTN_TP) for rank in range(_ATTN_TP)
+    ]
     for rank, part in enumerate(parts):
         assert part.shape == (tokens // _ATTN_TP, 6)
         assert torch.equal(part, hidden[rank::_ATTN_TP])
@@ -264,9 +268,7 @@ def test_gathered_slices_restore_and_one_token_pads():
         split_replicated_tokens(padded, rank, _ATTN_TP) for rank in range(_ATTN_TP)
     ]
     gathered = torch.cat(parts, dim=0)
-    restored = unpad_token_dim(
-        restore_gathered_tokens(gathered, _ATTN_TP), pad
-    )
+    restored = unpad_token_dim(restore_gathered_tokens(gathered, _ATTN_TP), pad)
     assert torch.equal(restored, hidden)
     sent = expert_dispatch_bytes(padded.shape[0], width, hidden.element_size())
     assert sent == padded.shape[0] * width * hidden.element_size()
