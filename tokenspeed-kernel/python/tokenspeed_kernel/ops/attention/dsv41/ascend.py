@@ -40,8 +40,8 @@ from tokenspeed_kernel.ops.attention.dsv41.compressor_torch import (
 from tokenspeed_kernel.ops.attention.dsv41.indexer_torch import index_topk_torch
 from tokenspeed_kernel.ops.attention.dsv41.pages import (
     PaBbndSelection,
-    adapt_flatkv_decode_selections,
     a2_cmp_topk,
+    adapt_flatkv_decode_selections,
     align_pa_block_for_a2,
     decode_cu_seqlens_q,
     host_seqused_max,
@@ -511,7 +511,7 @@ if current_platform().is_npu:
         index_metadata,
     ):
         """Gather FlatKV index pages and run torch Top-K (Ascend leaf)."""
-        del query_chunk_size, score_chunk_size, index_metadata
+        del query_chunk_size, score_chunk_size
         if process_group is not None:
             raise NotImplementedError(
                 "Ascend V4.1 indexer currently requires unreplicated index heads"
@@ -533,6 +533,7 @@ if current_platform().is_npu:
             candidate_topk,
             candidate_block_size,
             out,
+            index_metadata,
         )
 
     @register_kernel(

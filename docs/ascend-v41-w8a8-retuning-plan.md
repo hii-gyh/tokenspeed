@@ -12,6 +12,75 @@ deployment or benchmark, verify the running commit, worktree diff, container
 configuration, model configuration, and service health on all four nodes.
 Connection details and credentials must stay outside the repository.
 
+## Current execution status
+
+The chronological performance claims below are superseded as of 2026-11-16.
+Fair fresh Graph comparisons put TokenSpeed at about 23.4–23.7 output tokens/s
+versus 207.2 direct / 208.5 SMG tokens/s for vLLM-Ascend; the earlier 30% TokenSpeed
+advantage was an eager/graph and warmup mismatch. The current pure-decode
+index-key reuse patch passed three NPU tests and improved a paired same-service
+five-repeat mean from 24.2318 to 27.6735 tokens/s (1.14203x), with mean TPOT
+falling from 0.311667 to 0.265537 s (14.80%). Pure-decode profiling confirms
+that owner 20's large gather falls from five calls to one per step, with total
+GatherV3 time dropping from 69.576 to 30.405 ms/step. This is a TokenSpeed
+self-improvement, not vLLM parity. Full greedy text is not reproducible across
+reloads even after a symmetric rollback, so semantic quality remains an open
+gate. See `docs/ascend-v41-w8a8-serving-handoff.md` and
+`outputs/v41-debug/index-reuse-after/comparison.json` for current evidence.
+All twelve completed PD runs remain `performance_benefit=false`.
+
+## 2026-11-16 catch-up execution plan
+
+The current fixed-load gap is decode-dominant. With 47/48-token prompts and 128
+output tokens, the patched TokenSpeed TTFT p50 is 3.0627 s versus 0.7802 s for
+vLLM direct and 0.8232 s through SMG. Mean TPOT is 0.265537 s versus
+0.032645/0.032047 s. TTFT includes queueing and prefill rather than pure prefill
+compute. A simple `TTFT + 127 * TPOT` latency decomposition nevertheless assigns
+29.58–29.65 s of the 31.86–31.89 s per-request excess (about 93%) to the
+post-first-token path. Decode is therefore the primary optimization target;
+TTFT still needs a separate gate.
+
+The goal is to exceed both vLLM direct and SMG results under the existing fair
+contract, not to claim a win from a different warm-up, graph mode, router, or
+workload. Execute in this order:
+
+1. **Fresh correctness and baseline gate.** Start the patched service fresh,
+   warm both DP ranks with the full output-length contract, and rerun fixed
+   greedy Paris/counting/Chinese prompts plus five production repeats. Separate
+   reload-state corruption from patch or model numerics before adding another
+   optimization. Do not treat token completion or Paris inclusion as semantic
+   acceptance.
+2. **Paired pure-decode operator ledger.** Capture TokenSpeed and vLLM-Ascend
+   with the same DP-rank batch, visible lengths, graph mode, and stable decode
+   window. Compare per-step kernels, calls, stream overlap, and free time on the
+   same rank. Split per-layer costs multiplied by 40 from once-per-step costs.
+   The current TokenSpeed-only profile is insufficient to explain why vLLM is
+   about 32 ms while TokenSpeed remains about 265 ms per output token.
+3. **Structural decode changes before more micro-tuning.** Rank implementation
+   work by the paired ledger. The first candidate groups are cache/index writes
+   and layout copies (ViewCopy, ScatterNdUpdate, Index/IndexPut AsStrided),
+   remaining index scoring/dequantization (GatherV3, ReduceSum, Mul, RealDiv,
+   casts), and MoE/dispatch/combine plus SiluAndMul. These are measured
+   TokenSpeed cost groups, not yet proven vLLM differences. Do not repeat the
+   already rejected combined-global-writer, advanced-index graph writer, or
+   readback-elimination variants without new evidence.
+4. **Keep scheduling and backend gains separate.** After device changes,
+   remeasure non-overlapped communication and stream free time. Only then change
+   DP balance, admission, or router policy, and report scheduling and backend
+   contributions independently.
+5. **Close TTFT after decode milestones.** Split queueing from actual prefill
+   device time, then optimize the dominant side. Keep the current short-prompt
+   TTFT gate and add 512/2048-token prompt cases so a short-prefill tweak is not
+   misrepresented as a general prefill win.
+
+Use three checkpoints: TPOT at most 0.15 s with at least 50 output tokens/s,
+then TPOT at most 0.08 s with at least 100 output tokens/s, and finally higher
+throughput than both vLLM baselines with lower TPOT and TTFT p50. Final acceptance
+requires five fully warmed repeats for direct and SMG, all runs retained, exact
+operator regressions, graph-replay coverage, and full-text semantic checks on a
+fresh server. PD optimization remains paused until the aggregate path is
+competitive.
+
 ## What the existing measurements establish
 
 The historical deployment is a four-node, 32-card 910B3 service with DP4,

@@ -1,15 +1,15 @@
 # Ascend V4.1 W8A8 serving — tuning handoff
 
-**Location:** `docs/ascend-v41-w8a8-serving-handoff.md` (moved from `%TEMP%\e2e_v41_HANDOFF.md`)  
-**Branch:** `cursor/ascend-v41-w8a8-serving` (base `main`)  
-**Goal:** TokenSpeed vs vLLM-Ascend on same topology **DP4 / TP8 / EP32**, lean remote-only tuning.  
-**Target model:** DeepSeek-V4.1-Flash-w8a8  
-**Remote:** jump → nodes `192.168.11.11` (rank0), `.7` (r1), `.8` (r2), `.9` (r3)  
-**Deploy tree:** `/ts` mounted into `dsv41-ts-dp`  
-**Probe/logs:** host `/root/gyh_dev/token_speed_dsv41flash/` (container `/probe`)  
-**Local helpers:** `%TEMP%\e2e_v41_ts_dp4.py` + many `e2e_v41_*.py`  
-**Python (Windows driver):** `C:\Users\Lenovo\AppData\Local\Python\bin\python.exe`  
-**HEAD (as of handoff):** `53f58ea12` — FlatKV gather OOM/view fix (on top of `ca284be12` torch FlatKV pin)  
+**Location:** `docs/ascend-v41-w8a8-serving-handoff.md` (moved from `%TEMP%\e2e_v41_HANDOFF.md`)
+**Branch:** `cursor/ascend-v41-w8a8-serving` (base `main`)
+**Goal:** TokenSpeed vs vLLM-Ascend on same topology **DP4 / TP8 / EP32**, lean remote-only tuning.
+**Target model:** DeepSeek-V4.1-Flash-w8a8
+**Remote:** jump → nodes `192.168.11.11` (rank0), `.7` (r1), `.8` (r2), `.9` (r3)
+**Deploy tree:** `/ts` mounted into `dsv41-ts-dp`
+**Probe/logs:** host `/root/gyh_dev/token_speed_dsv41flash/` (container `/probe`)
+**Local helpers:** `%TEMP%\e2e_v41_ts_dp4.py` + many `e2e_v41_*.py`
+**Python (Windows driver):** `C:\Users\Lenovo\AppData\Local\Python\bin\python.exe`
+**HEAD (as of handoff):** `53f58ea12` — FlatKV gather OOM/view fix (on top of `ca284be12` torch FlatKV pin)
 **JSON/profile artifacts:** still under `%TEMP%\e2e_v41_*.json` / `e2e_profile_*` (not committed)
 
 ---
@@ -63,7 +63,7 @@ Plus B2/B3: fix unexplained math; align vs vLLM stages.
 - **Pin torch FlatKV** codecs for Ascend (`ca284be12`).
 
 ### Step5 FlatKV codec (gather / scatter / select)
-- **5a gather SHIPPED:** LUT + safe 1D `_transfer_selected` + `_GATHER_ROW_CHUNK`.  
+- **5a gather SHIPPED:** LUT + safe 1D `_transfer_selected` + `_GATHER_ROW_CHUNK`.
   Historical **gather_global p50 ≈ 2.77 ms** (best reference).
 - **5b scatter:** profiles/alts; partial.
 - **5c select:** `.item()` trim **reverted** (graph sync). Graph trim failed capture.
@@ -138,12 +138,12 @@ Plus B2/B3: fix unexplained math; align vs vLLM stages.
 
 ## What is NOT the main lever anymore
 
-- Triton/TileLang FlatKV on Ascend  
-- Another gather/scatter codec thrash without new evidence  
-- Silu / `forward_native` / `clamp_max` (already on NPU path)  
-- ngram **commit** (prior fix; mm_timing-light)  
-- select `.item()` trim  
-- Live VIZTRACER for attribution  
+- Triton/TileLang FlatKV on Ascend
+- Another gather/scatter codec thrash without new evidence
+- Silu / `forward_native` / `clamp_max` (already on NPU path)
+- ngram **commit** (prior fix; mm_timing-light)
+- select `.item()` trim
+- Live VIZTRACER for attribution
 
 ---
 
@@ -179,6 +179,68 @@ When serve stable; compare to `e2e_vllm_stage.json` (or re-bench vLLM if NPUs fr
 
 ---
 
+## 2026-11-16 pure-decode index-key reuse
+
+This section supersedes the earlier performance claims in this handoff. The old
+"30% faster than vLLM" result compared TokenSpeed NPU Graph with vLLM eager and
+did not warm both engines to the same output length. Fresh, fully warmed Graph
+runs instead measured TokenSpeed at 23.6990/23.4362 output tokens/s with
+0.315679/0.317973 s mean TPOT. Fresh vLLM-Ascend Graph measured 207.1864
+output tokens/s direct and 208.5003 through SMG, with 0.032645/0.032047 s mean
+TPOT. Direct versus SMG changed vLLM throughput by only about 0.63%, so router
+overhead cannot explain the remaining engine gap.
+
+A ten-step pure-DECODE profile on run `20261116T034256Z-415-cluster2` used eight
+requests per batch and excluded new prefill from the capture window. Stable
+steps 2–9 contain eight large index-key gathers per model step: three
+`2304x68` gathers and five `4352x68` gathers, totaling about 64.77 ms/step.
+The model has KV owners `[2,8,14,20]` but index sources
+`[2,8,14,20,24,28,32,36]`; owner 20 was being gathered and dequantized five
+times per forward. The neighboring scale decode, FP4 lookup, and batch matmul
+nodes identify these as index-topk scoring reads, not BF16 mirror reads or
+scatter-writer readback.
+
+The current patch caches dequantized torch keys on `IndexMetadata` for paged
+decode/verify only, keyed by index-cache identity. Reindex layers sharing an
+owner reuse the first layer's keys; dense prefill retains no large keys. Public
+`dsv41.index_topk` signatures are unchanged. Three real-NPU tests cover eager
+reuse, graph replay after cache refresh, and dense-prefill non-retention
+(`3 passed`). A five-way graph microbenchmark measured 1.889x on 2304 rows and
+1.834x on 4352 rows, with exact tensor equality in both cases. These are
+subcomponent results, not end-to-end speedups.
+
+The paired production A/B used the same fresh service and graph configuration,
+8 concurrency, 16 requests, 128 output tokens, a 16-request/128-token warmup,
+and five measured repeats. Before the patch, throughput was
+23.9376/24.3148/24.2695/24.3029/24.3345 tokens/s and mean TPOT averaged
+0.311667 s. After reload, throughput was
+26.8547/27.7888/27.8772/27.9273/27.9195 tokens/s and mean TPOT averaged
+0.265537 s. Thus mean throughput increased 1.14203x and mean TPOT decreased
+14.80%; every paired repeat improved. Artifacts are under
+`outputs/v41-debug/index-reuse-before/`, `index-reuse-after/`, and
+`index-key-reuse-micro.json`.
+
+Text quality remains a separate open gate. Three fixed greedy prompts produced
+different full texts before patch, after patch, and after a symmetric rollback
+reload, so repeated reloads are not text-reproducible and this A/B cannot assign
+the differences to the patch. Paris inclusion still passes as a smoke check,
+but long counting/Chinese outputs contain obvious degradation; token-count
+completion and Paris inclusion must not be represented as semantic acceptance.
+The three NPU tests establish the patched op's numerical behavior, not full
+model text quality. A follow-up six-step pure-decode profile confirms that the production path now
+performs three `2304x68` gathers and only one `4352x68` gather per step (down
+from five). GatherV3 fell from 69.576 to 30.405 ms/step and mean profiler stage
+time fell from 329.983 to 280.219 ms (15.08%). Profiler timings are attribution
+evidence only; the formal performance result is the five-repeat production A/B
+above. Raw and summarized comparisons are under
+`outputs/v41-debug/index-reuse-pure-decode-profile-20261116T034256Z-415/`.
+
+PD disaggregation has twelve completed real runs, all with
+`performance_benefit=false`; the best observed TPOT was 0.304624 s and maximum
+throughput was 21.0309 tokens/s. Functional Mooncake and Rust-loader transport
+checks do not change that negative performance result. PD optimization remains
+behind aggregate competitiveness in priority.
+
 ## Key files
 
 | Area | Path |
@@ -193,13 +255,13 @@ When serve stable; compare to `e2e_vllm_stage.json` (or re-bench vLLM if NPUs fr
 
 ## Key artifacts
 
-- `docs/ascend-v41-w8a8-serving-handoff.md` — this file  
-- `%TEMP%\e2e_v41_phaseA_oom.json` / `phaseB_baseline.json` / `phaseC_gather.json`  
-- `e2e_v41_b2_attribution.json` / `e2e_v41_b3_ts_vs_vllm.json`  
-- `e2e_v41_cprime_silu.json` / `e2e_v41_c2_residual.json`  
-- `e2e_vllm_stage.json`  
-- `e2e_v41_step5_ledger.json` + step5* profiles  
-- Prior profiles: `e2e_profile_after_silu.txt`, `e2e_profile_after_ngram.py` outputs  
+- `docs/ascend-v41-w8a8-serving-handoff.md` — this file
+- `%TEMP%\e2e_v41_phaseA_oom.json` / `phaseB_baseline.json` / `phaseC_gather.json`
+- `e2e_v41_b2_attribution.json` / `e2e_v41_b3_ts_vs_vllm.json`
+- `e2e_v41_cprime_silu.json` / `e2e_v41_c2_residual.json`
+- `e2e_vllm_stage.json`
+- `e2e_v41_step5_ledger.json` + step5* profiles
+- Prior profiles: `e2e_profile_after_silu.txt`, `e2e_profile_after_ngram.py` outputs
 
 ## Agent transcripts (parent)
 
@@ -209,4 +271,4 @@ Cursor agent conversation under project `tokenspeed`; Phase C / B2 agents id `70
 
 ## One-sentence status
 
-**Torch FlatKV is pinned and OOM-safe with a mild gather win; Silu/ngram-commit already fixed; TokenSpeed eager decode is still ~4× slower than vLLM because ~⅔ of model_fwd is unattributed non-FlatKV compute — next ship fine-grained forward timers, then gate the next kernel change.**
+**Current status: fair fully warmed Graph comparisons still place TokenSpeed well below vLLM-Ascend, and the earlier 30% advantage is invalid. Pure-decode profiling identified repeated index-key gather/dequantization; per-owner key reuse passed three NPU tests and improved the same-service five-repeat production mean from 24.2318 to 27.6735 output tokens/s (1.14203x), reducing mean TPOT from 0.311667 to 0.265537 s (14.80%). This is a real TokenSpeed self-improvement, not parity with vLLM and not semantic text-quality acceptance. Repeated reloads change full greedy outputs even without the patch, so text reproducibility remains open. Twelve PD runs have no overall performance benefit; PD remains lower priority than closing the aggregate-engine gap.**

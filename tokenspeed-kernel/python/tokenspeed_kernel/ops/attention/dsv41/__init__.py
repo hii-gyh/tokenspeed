@@ -1695,8 +1695,9 @@ def new_index_metadata(
     -1), so a padding row cannot end an active request's run. All supplied
     tensors must remain unchanged for this object's lifetime. Share it only
     between layers of one forward; create a new object for every eager
-    invocation and graph capture. Replay recomputes the captured producers. No
-    KV values or scores are cached. Consumers on other streams wait for metadata
+    invocation and graph capture. Replay recomputes the captured producers. The
+    paged Ascend torch scorer may cache dequantized keys, never scores, for
+    layers sharing this geometry. Consumers on other streams wait for metadata
     producers before reading. Cached geometry is retained until this object is
     released.
 

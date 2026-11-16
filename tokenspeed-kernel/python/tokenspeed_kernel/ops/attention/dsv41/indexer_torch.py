@@ -27,7 +27,7 @@ path consumes PA_BBND pages directly. Scores are ``sum_h weight_h * relu(q_h·k)
 from __future__ import annotations
 
 import torch
-
+from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexMetadata
 from tokenspeed_kernel.ops.attention.dsv41.cache_codec_torch import cache_gather_torch
 
 _PAGE_ROWS = 64
@@ -38,7 +38,9 @@ def _index_format(index_cache: torch.Tensor) -> str:
     if width == 68:
         return "index"
     if width == 132:
-        raise ValueError("Ascend torch indexer expects v41 index rows (68B), not index_v4")
+        raise ValueError(
+            "Ascend torch indexer expects v41 index rows (68B), not index_v4"
+        )
     raise ValueError(f"unsupported index cache row width {width}")
 
 
@@ -58,7 +60,9 @@ def _logical_slots(
         & (page_ids > 0)
     )
     slots = torch.where(
-        valid, page_ids * _PAGE_ROWS + row[None, :], torch.full((), -1, device=page_table.device, dtype=torch.int64)
+        valid,
+        page_ids * _PAGE_ROWS + row[None, :],
+        torch.full((), -1, device=page_table.device, dtype=torch.int64),
     )
     return slots, max_cols
 
@@ -117,7 +121,9 @@ def _candidate_blocks_from_rows(
         cols = torch.arange(width, device=rows.device)
         take = cols[None, :] < lengths.to(torch.int64)[:, None].clamp(0, width)
         valid = take & (rows >= 0)
-        block = torch.div(rows.to(torch.int64).clamp(min=0), block_size, rounding_mode="floor")
+        block = torch.div(
+            rows.to(torch.int64).clamp(min=0), block_size, rounding_mode="floor"
+        )
         hi = torch.maximum(block.amax(), newest.amax()) + 1
         keyed = torch.where(valid, block, hi)
         already = (valid & (block == newest[:, None])).any(dim=-1)
@@ -140,7 +146,9 @@ def _candidate_mask(
 ) -> torch.Tensor:
     """True for columns covered by a non-negative candidate block."""
     tokens = candidate_blocks.shape[0]
-    mask = torch.zeros(tokens, max_cols, dtype=torch.bool, device=candidate_blocks.device)
+    mask = torch.zeros(
+        tokens, max_cols, dtype=torch.bool, device=candidate_blocks.device
+    )
     if max_cols == 0 or candidate_blocks.numel() == 0:
         return mask
     blocks = candidate_blocks.to(torch.int64)
@@ -168,6 +176,7 @@ def index_topk_torch(
     candidate_topk: int,
     candidate_block_size: int,
     out: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    index_metadata: IndexMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Full/Reindex Top-K over FlatKV index pages (device torch path)."""
     if index_q.ndim != 3 or index_q.shape[-1] != 128:
@@ -190,8 +199,21 @@ def index_topk_torch(
         return rows, lens, blocks, block_lens
 
     fmt = _index_format(index_cache)
-    slots, max_cols = _logical_slots(page_table, visible_lens)
-    keys = cache_gather_torch(index_cache, slots, fmt, None)  # [T, K, 128]
+    max_cols = page_table.shape[1] * _PAGE_ROWS
+    cached = None
+    cache_keys = index_metadata is not None and index_metadata.history_rows is None
+    if cache_keys:
+        index_metadata.validate(page_table, visible_lens)
+        cached = index_metadata.torch_keys.get(id(index_cache))
+    if cached is None:
+        slots, _ = _logical_slots(page_table, visible_lens)
+        keys = cache_gather_torch(index_cache, slots, fmt, None)  # [T, K, 128]
+        if cache_keys:
+            index_metadata.torch_keys[id(index_cache)] = (index_cache, keys)
+    else:
+        cached_cache, keys = cached
+        if cached_cache is not index_cache:
+            raise RuntimeError("index metadata key cache aliased a different owner")
     # scores[t, k] = sum_h weight[t,h] * relu(q[t,h]·key[t,k])
     q = index_q.float()
     k = keys.float()
