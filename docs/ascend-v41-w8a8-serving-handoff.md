@@ -540,6 +540,20 @@ roughly 5.1 GB free. Together with the prior per-service 56-60 GB measurement,
 a second world-size-16 same-spec service still cannot be co-resident on this
 16-card footprint; the accepted comparison remains alternating residency.
 
+## 2026-11-16 late retry: TS 418 fresh service and five-round ledger
+
+After the 646 rank-1 weight-load failure (`aclrtMemcpy 107017` / devmm user-pages pin failure), retry run `20261116T201549Z-418-cluster2` passed two-node Graph readiness in 1733.45s. Both 418 containers remain Up; rank0 `/health` returns 200 and `/v1/models` lists `deepseek-v41`. The 646 failure remains unclosed: 418 did not reproduce a new devmm error, but one successful retry does not prove the host-paging/lifecycle root cause is gone.
+
+The strict three-prompt gate still fails for 418 (`outputs/v41-debug/20261116T201549Z-418-cluster2/418-gate.json`, blocking `paris,count,chinese`). The benchmark driver's built-in Paris keyword check reports `ok=true`, but that is only a smoke keyword match and must not be treated as semantic acceptance.
+
+The 418 five-round fixed-load stream ledger is
+`outputs/v41-debug/20261116T201549Z-418-cluster2/418-benchmark-nogate.json`. All five rounds had zero errors, `fill_ratio=1.0`, and 2048 completion tokens per round. Results: throughput mean 27.6516 tok/s, median 28.1668, min 26.1188, max 28.2964; TTFT p50 2.62580s, p90 4.41417s; TPOT mean 0.267813s, p50 0.265668s, p90 0.275566s. Round throughputs were 26.1188 / 27.5084 / 28.1675 / 28.1668 / 28.2964 tok/s.
+
+The 418-vs-420 alternating comparison is
+`outputs/v41-debug/20261116T201549Z-418-vs-420-comparison.json`. TS 418 throughput is 0.13193x vLLM 420 (vLLM 7.5799x TS), TPOT mean is 8.3987x vLLM, and TTFT p50 is 3.2329x vLLM. The rough 127-post-prefill-token decomposition attributes 29.9625s of excess to decode/TPOT and 1.81358s to TTFT, i.e. about 94.29% decode/post-first-token under this short mixed load. This remains a request-level rough estimate, not a paired kernel ledger.
+
+418 versus the same-family TS 427 shows no meaningful fresh improvement: throughput 0.98780x, TPOT 1.00619x, TTFT p50 0.99114x. The pending prefill SWA BF16 mirror candidate therefore still has no measured end-to-end win or validated numeric consistency. Only three warmup decode timing rows were captured before the benchmark; their host-side split averages attention 441.90ms (36.4%), FFN 647.11ms (53.4%, routed MoE 592.99ms / 48.9%), but this small warmup sample is not a steady paired profile.
+
 ## Key files
 
 | Area | Path |
@@ -572,17 +586,4 @@ Cursor agent conversation under project `tokenspeed`; Phase C / B2 agents id `70
 
 ## One-sentence status
 
-**Current status: vLLM-Ascend 420 is Up on the alternating 16-card footprint;
-TS 427 is stopped with evidence retained. Fresh alternating five-round results
-still show TS at 0.13356x vLLM throughput (27.993 vs 209.596 tok/s), 8.3470x
-TPOT (0.2662 vs 0.0319s), and 3.2617x TTFT p50 (2.649 vs 0.812s). Rough
-request-level excess remains decode-dominant (~94.18%). Both sides fail the
-strict fixed-prompt gate; the 420 vLLM smoke failure is retained separately
-from the temporary performance-only five-round collection. The controlled TS
-rank0 prefill evidence is partial, and the paired TS/vLLM prefill/decode
-ledger remains open. BF16-mirror synchronization and MoE `ctx` propagation
-remain unproven suspects, not closed root causes. Priority order: close or
-isolate the fresh text gate, validate the mirror candidate only after
-tensor/Graph consistency checks, build paired decode/prefill ledgers, rank and
-validate backend fixes, then resume PD only after the aggregate path is
-competitive.**
+**Current status: TS 418 is Up on the alternating 16-card footprint; vLLM-Ascend 420 is stopped with its retained five-round ledger and failed strict gate. Fresh 418 five-round results are 27.6516 tok/s, TPOT mean 0.267813s, TTFT p50 2.62580s; against vLLM 420 this is 0.13193x throughput (vLLM 7.5799x TS), 8.3987x TPOT, and 3.2329x TTFT p50. Rough request-level excess remains decode-dominant (~94.29%). The 418 strict fixed-prompt gate still fails (`paris,count,chinese`); the keyword-only benchmark smoke is not correctness closure. The controlled TS rank0 prefill evidence is partial, paired TS/vLLM prefill/decode ledgers remain open, and the BF16-mirror/MoE-`ctx` suspects are unproven. Priority order: close or isolate the fresh text gate, validate mirror tensor/Graph consistency before claiming a win, build paired decode/prefill ledgers, rank and validate backend fixes, then resume PD only after the aggregate path is competitive.**
