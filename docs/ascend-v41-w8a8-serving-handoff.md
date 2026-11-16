@@ -477,9 +477,14 @@ available `mirror_rows`, otherwise gathers from packed cache and scatters into
 The leading unproven correctness suspect is whether mirror pages are
 repopulated/invalidated consistently on prefix-cache restore, eviction, Graph
 replay, reload-forward, or cache refresh. A stale mirror would degrade attention
-output, but this remains source-path evidence only: no packed-vs-mirror tensor
-comparison, hidden-state check, expert-routing comparison, or fresh A/B has
-closed the root cause.
+output. Source review found a concrete gap: global writes and the decode SWA
+current-row write populate their BF16 mirrors, but the prefill SWA path wrote
+packed uint8 rows without a matching `swa_bf16` mirror scatter. A local patch now
+repopulates old-prefix and current SWA mirror rows in the NPU prefill path; only
+`py_compile` has passed so far. No fresh-server text gate, packed-versus-mirror
+tensor equality check, Graph-replay equivalence check, or five-repeat A/B has
+run, so this remains a pending correctness/performance candidate rather than a
+closed root cause or measured win.
 
 The leading decode performance candidates are still mirror gather/scatter/copy
 and the remaining index-scoring elementwise path. The post-reuse TS-only
