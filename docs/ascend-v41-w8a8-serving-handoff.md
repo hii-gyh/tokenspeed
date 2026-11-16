@@ -434,14 +434,14 @@ partial, not closed.
 
 After the 481 controlled prefill collection, the two TS 481 containers were
 gracefully stopped and their NPU HBM was released; the stopped containers were
-not removed. The retained 431 vLLM-Ascend containers were then restarted on
-the same two-node 16-card footprint, same Graph mode, same
-`DeepSeek-V4.1-Flash-w8a8` weights, topology, max length, batch size and
-prefix-caching configuration. Rank 0 `/health` returns 200 and `/v1/models`
-lists `deepseek-v41`; each NPU subsequently holds about 60.4 GB HBM. The 16-card
-deployment still cannot keep two world-size-16 model services resident at once,
-so the fair comparison is an alternating-residency measurement, not a
-co-resident one.
+not removed. The retained 431 vLLM-Ascend containers were then restarted on the
+same two-node 16-card footprint. At the current 18:05 UTC check, 431 is Up on
+both nodes, rank 0 `/health` returns 200, `/v1/models` lists `deepseek-v41`, and a
+short 4-token chat completion smoke request returned 4 completion tokens. That
+smoke proves the service is resident and generating; it does not pass the
+strict semantic text gate. The 16-card deployment still cannot keep two
+world-size-16 model services resident at once, so the fair comparison remains
+alternating residency, not a co-resident one.
 
 The same three fixed greedy prompts (`The capital of France is`,
 `Count from 1 to 20, separated by spaces.`, and the Chinese preheat
@@ -457,6 +457,44 @@ establishes that the W8A8 weights/tokenizer baseline is not as broken as the
 TS output, but it does **not** by itself identify whether the TS fault is in
 attention/KV/indexer/MoE/hidden-state routing, the LM-head/logits path, or a
 Graph/context reload issue.
+
+
+## 2026-11-16 local code review: mirror and correctness candidates
+
+This check was a local source review and read-only remote status check; it did
+not restart a TS service, run a long benchmark, change code/config, or remove
+remote resources. Ignoring CRLF noise, the real V4.1-adjacent uncommitted delta
+is small: `device.py` adds a `device_type` profiling property; the V4.1
+attention backend adds the NPU BF16 page-mirror path; the model file is mostly
+`layer_kind_scope`/`active_forward` timing wrappers, with MoE FFN `ctx`
+propagation changes that still need tensor-level validation.
+
+The NPU mirror allocates `swa_bf16` and `global_bf16` alongside the packed
+uint8 KV cache. The live global write path gathers selected packed rows,
+dequantizes them, and scatters them into `global_bf16`; the SWA path writes the
+available `mirror_rows`, otherwise gathers from packed cache and scatters into
+`swa_bf16`; decode reads `ascend_paged_attention_from_bf16` from that mirror.
+The leading unproven correctness suspect is whether mirror pages are
+repopulated/invalidated consistently on prefix-cache restore, eviction, Graph
+replay, reload-forward, or cache refresh. A stale mirror would degrade attention
+output, but this remains source-path evidence only: no packed-vs-mirror tensor
+comparison, hidden-state check, expert-routing comparison, or fresh A/B has
+closed the root cause.
+
+The leading decode performance candidates are still mirror gather/scatter/copy
+and the remaining index-scoring elementwise path. The post-reuse TS-only
+decode ledger has ViewCopy 31.916 ms/step, GatherV3 30.405 ms/step,
+ScatterNdUpdate 25.653 ms/step, AsStrided/IndexPut copies 13.323+6.785
+ms/step; MoE dispatch/combine and grouped matmul remain separate groups.
+These numbers cannot by themselves prove a vLLM kernel-level gap, and no
+backend change should be claimed as a win before the paired ledger and
+five-repeat fresh A/B.
+
+The other node pair was checked read-only: `.109` has idle NPU memory, while
+`.110` still runs six `pd-pat` prefill/decode processes at about 53.6-53.8 GB
+per occupied card, leaving only two apparent free cards. There is therefore no
+ready independent 16-card co-resident pool for a second world-size-16 service in
+the current snapshot.
 
 ## Key files
 
@@ -490,4 +528,16 @@ Cursor agent conversation under project `tokenspeed`; Phase C / B2 agents id `70
 
 ## One-sentence status
 
-**Current status: TS 481 has been stopped after controlled prefill collection; vLLM-Ascend 431 is currently Up and healthy on the same alternating-residency 16-card footprint. The prior fair baseline still shows TS at about 0.122x vLLM throughput (26.155 vs 214.398 output tokens/s), 8.63x TPOT (0.2741 vs 0.0318 s), and 4.41x TTFT p50 (3.366 vs 0.763 s). Rough request-level excess remains decode-dominant (~92.20%); TS pure-prefill rank0 evidence is partial, and the paired TS/vLLM prefill/decode ledger remains open. The paired text gate shows vLLM reference is only partial-pass while TS is materially more degenerate, but the exact TS-side fault is not closed. The next priority is a paired TS/vLLM pure-decode and pure-prefill kernel/collective ledger, then ranked backend decode fixes and a closed text-quality gate; PD disaggregation remains paused until the aggregate path is competitive.**
+**Current status: vLLM-Ascend 431 is Up and healthy on the alternating 16-card
+footprint and returned a short 4-token smoke completion; TS 481 is stopped with
+HBM released. The fair baseline still shows TS at about 0.122x vLLM throughput
+(26.155 vs 214.398 output tokens/s), 8.63x TPOT (0.2741 vs 0.0318 s), and
+4.41x TTFT p50 (3.366 vs 0.763 s). Rough request-level excess remains
+decode-dominant (~92.20%). The controlled TS rank0 prefill evidence is partial,
+and the paired TS/vLLM prefill/decode ledger remains open. The paired text gate
+shows vLLM reference is only partial-pass while TS is materially more
+degenerate; the local review flags BF16-mirror synchronization and MoE `ctx`
+propagation as unproven suspects, not closed root causes. Priority order: close
+or isolate the fresh text gate, build paired decode/prefill ledgers, rank and
+validate backend fixes, then resume PD only after the aggregate path is
+competitive.**
