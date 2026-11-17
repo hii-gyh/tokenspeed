@@ -554,6 +554,16 @@ The 418-vs-420 alternating comparison is
 
 418 versus the same-family TS 427 shows no meaningful fresh improvement: throughput 0.98780x, TPOT 1.00619x, TTFT p50 0.99114x. The pending prefill SWA BF16 mirror candidate therefore still has no measured end-to-end win or validated numeric consistency. Only three warmup decode timing rows were captured before the benchmark; their host-side split averages attention 441.90ms (36.4%), FFN 647.11ms (53.4%, routed MoE 592.99ms / 48.9%), but this small warmup sample is not a steady paired profile.
 
+## 2026-11-17 phase 0 gate: read-only resource/baseline/probe check
+
+This round stayed read-only for service state: no restart, long benchmark, code/config change, or remote cleanup. The retained TS 418 service is still Up on both ranks; rank0 `/health` returns 200 and `/v1/models` lists the W8A8 model and `deepseek-v41`. vLLM 420 remains `Exited (137)` with its five-round ledger retained. Rank0 root is 99% full (5.4G free), `/dev/shm` is 99% full (3.9G free), and `/mnt` NFS is 100% full; rank1 root has 251G free but `/dev/shm` is 90% full. Old rank0 shm profile products total about 41.8G and rank1 about 19.6G; no deletion was authorized, so a new remote profile should not be written until cleanup ownership/space is confirmed.
+
+The phase 0 gate ledger is `outputs/v41-debug/phase0-gate-20261117T0753Z.json`. It records that the latest alternating fixed-load gap remains decode-dominated at the request level: TS 418 27.6516 tok/s, TPOT mean 0.267813s, TTFT p50 2.62580s versus vLLM 420 209.5961 tok/s, TPOT mean 0.031887s, TTFT p50 0.812222s; TS is 0.13193x throughput, 8.39872x TPOT, and 3.23286x TTFT p50. Rough excess is 94.29% decode/post-first-token, but that remains a request-level estimate, not a paired kernel ledger.
+
+A standalone CPU FlatKV probe ran inside the existing 418 container (`outputs/v41-debug/probe_dsv41_torch_codec_cpu.py`, result `probe-dsv41-torch-codec-cpu-result.json`). On torch 2.10.0+cpu, swa/global/index packed scatter->gather roundtrip is exact (max abs diff 0.0), invalid slots read zero, and swa/global BF16 mirror write->read roundtrip is exact (mirror max abs diff 0.0). Three runtime files passed remote AST parse. These are CPU/syntax checks only: they do not exercise the NPU scatter kernel, Graph replay, reload-forward, prefix restore/evict, live packed-versus-mirror equality, hidden-state/router/logits comparison, or a fresh-service text gate. Plain packaged pytest collection still fails before tests because the dsv41 package `__init__` imports the unavailable `cann_ops_transformer` CANN adapter in the CPU Python.
+
+No new end-to-end performance result or correctness closure was produced this round. The strict 418 gate still fails (`paris,count,chinese`), and the retained vLLM 420 gate also fails. The next executable work is a CPU/container import-safe tensor ladder for packed cache, mirror rows, inactive/duplicate slots, prefix restore and index reuse; NPU-side hidden-state, router and logits comparisons remain blocked until a controlled fresh-service or replay path is available with enough remote space.
+
 ## Key files
 
 | Area | Path |
