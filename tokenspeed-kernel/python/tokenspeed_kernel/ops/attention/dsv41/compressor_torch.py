@@ -30,6 +30,47 @@ from __future__ import annotations
 import torch
 
 
+def _tail_rows(
+    tail: torch.Tensor, page: torch.Tensor, row: torch.Tensor, half: int
+) -> torch.Tensor:
+    """Read ``[N,512]`` FP32 tail rows through a flat view of the arena.
+
+    ``tail[page, row, half]`` makes CANN reconstitute the whole arena the tail
+    view sits in before selecting the rows. Selecting from a 1-D view touches
+    only the requested elements, and pairing them into int64 halves the index
+    count again. The int64 view only reinterprets bytes.
+    """
+    if tail.device.type == "npu":
+        # This torch codec is the Ascend leaf, so call its row reader directly
+        # instead of dispatching the full compressor-pool op through the registry.
+        from tokenspeed_kernel.ops.attention.dsv41.triton import (
+            compressor_tail_rows,
+        )
+
+        return compressor_tail_rows(tail, page, row, half)
+
+    pages = int(tail.shape[0])
+    page_stride = int(tail.stride(0))
+    row_span = 2 * 2 * 512
+    storage_len = (pages - 1) * page_stride + row_span
+    flat = tail.as_strided((storage_len,), (1,))
+    base = (
+        page.to(torch.int64) * page_stride
+        + row.to(torch.int64) * (2 * 512)
+        + half * 512
+    )
+    if page_stride % 2 == 0 and storage_len % 2 == 0 and flat.storage_offset() % 2 == 0:
+        offsets = base.unsqueeze(1) // 2 + torch.arange(
+            256, device=tail.device, dtype=torch.int64
+        )
+        gathered = torch.index_select(flat.view(torch.int64), 0, offsets.reshape(-1))
+        return gathered.view(torch.float32).reshape(page.shape[0], 512)
+    offsets = base.unsqueeze(1) + torch.arange(
+        512, device=tail.device, dtype=torch.int64
+    )
+    return torch.index_select(flat, 0, offsets.reshape(-1)).reshape(page.shape[0], 512)
+
+
 def compressor_pool_torch(
     content: torch.Tensor,
     scores: torch.Tensor,
@@ -97,8 +138,12 @@ def compressor_pool_torch(
     safe_slots = tail_slots.clamp(0, capacity)
     page = torch.div(safe_slots, 2, rounding_mode="floor")
     row = safe_slots % 2
-    tail_content = tail[page, row, 0]
-    tail_scores = tail[page, row, 1]
+    if tail.device.type == "npu":
+        tail_content = _tail_rows(tail, page, row, 0)
+        tail_scores = _tail_rows(tail, page, row, 1)
+    else:
+        tail_content = tail[page, row, 0]
+        tail_scores = tail[page, row, 1]
     old_content = torch.where(in_tail[:, None], tail_content, old_content)
     old_scores = torch.where(in_tail[:, None], tail_scores, old_scores)
 
@@ -184,13 +229,34 @@ def compressor_tail_scatter_torch(
     row = safe.remainder(2)
     # Rank-1 indices stay on device. A 0-dim index copies the coordinate back
     # to the host and aborts graph capture.
-    current_content = tail[page, row, 0]
-    current_scores = tail[page, row, 1]
+    if tail.device.type == "npu":
+        current_content = _tail_rows(tail, page, row, 0)
+        current_scores = _tail_rows(tail, page, row, 1)
+    else:
+        current_content = tail[page, row, 0]
+        current_scores = tail[page, row, 1]
     mask = live.unsqueeze(1)
     key = page.to(torch.int64) * 2 + row.to(torch.int64)
-    tail[page, row, 0] = _winning_rows(
+    winning_content = _winning_rows(
         key, live, torch.where(mask, content, current_content)
     )
-    tail[page, row, 1] = _winning_rows(
-        key, live, torch.where(mask, scores, current_scores)
-    )
+    winning_scores = _winning_rows(key, live, torch.where(mask, scores, current_scores))
+    if tail.device.type == "npu":
+        from tokenspeed_kernel.ops.attention.dsv41._ascend_codec import (
+            scatter_compressor_tail_,
+        )
+
+        # Advanced-index assignment here makes CANN copy the whole arena the
+        # tail view sits in, once per assignment. The vendor ND scatter writes
+        # the same rows in place.
+        coordinate = torch.stack((page.to(torch.int64), row.to(torch.int64)), dim=1)
+        half = torch.zeros_like(coordinate[:, :1])
+        scatter_compressor_tail_(
+            tail, torch.cat((coordinate, half), dim=1), winning_content
+        )
+        scatter_compressor_tail_(
+            tail, torch.cat((coordinate, half + 1), dim=1), winning_scores
+        )
+        return
+    tail[page, row, 0] = winning_content
+    tail[page, row, 1] = winning_scores

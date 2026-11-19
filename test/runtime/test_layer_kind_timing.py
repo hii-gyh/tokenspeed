@@ -27,6 +27,7 @@ from tokenspeed.runtime.execution import layer_kind_timing as timing
 from tokenspeed.runtime.execution.layer_kind_timing import (
     LayerKindTimer,
     LayerKindTimingRecorder,
+    layer_kind_scope,
 )
 
 
@@ -103,7 +104,7 @@ def test_graph_capture_does_not_allocate_events(monkeypatch):
     monkeypatch.setattr(timing.torch, "get_device_module", unexpected)
     recorder = LayerKindTimingRecorder(rank=0)
 
-    assert recorder.start(torch.device("npu"), mode="DECODE", bs=1) is None
+    assert recorder.start(torch.device("cuda"), mode="DECODE", bs=1) is None
 
 
 def test_incomplete_events_are_not_read_or_synchronized(monkeypatch):
@@ -112,7 +113,7 @@ def test_incomplete_events_are_not_read_or_synchronized(monkeypatch):
     lines = []
     monkeypatch.setattr(timing.logger, "info", lines.append)
     recorder = LayerKindTimingRecorder(rank=0)
-    timer = recorder.start(torch.device("npu"), mode="DECODE", bs=1)
+    timer = recorder.start(torch.device("cuda"), mode="DECODE", bs=1)
     assert timer is not None
 
     with timer.scope("layer", 0):
@@ -147,10 +148,15 @@ def test_incomplete_events_are_not_read_or_synchronized(monkeypatch):
     assert len(lines) == 1
 
 
+def test_scope_without_context_preserves_uninstrumented_path():
+    with layer_kind_scope(None, "moe_select", 0):
+        pass
+
+
 def test_exception_still_closes_scope():
     module = FakeDeviceModule()
     timer = LayerKindTimer(
-        torch.device("npu"),
+        torch.device("cuda"),
         mode="DECODE",
         bs=1,
         step=0,
@@ -176,12 +182,12 @@ def test_unsampled_forward_allocates_no_events(monkeypatch):
     monkeypatch.setattr(timing.logger, "info", lines.append)
     recorder = LayerKindTimingRecorder(rank=0)
     for _ in range(4):
-        timer = recorder.start(torch.device("npu"), mode="DECODE", bs=1)
+        timer = recorder.start(torch.device("cuda"), mode="DECODE", bs=1)
         assert timer is not None
         recorder.finish(timer)
     before = len(module.events)
 
-    assert recorder.start(torch.device("npu"), mode="DECODE", bs=1) is None
+    assert recorder.start(torch.device("cuda"), mode="DECODE", bs=1) is None
     assert len(module.events) == before
 
     module.complete_all()

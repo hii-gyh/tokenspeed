@@ -226,12 +226,12 @@ def _float_to_e4m3(values: torch.Tensor) -> torch.Tensor:
     if values.is_cuda:
         return values.to(torch.float8_e4m3fn).view(torch.uint8)
     x = values.float()
-    sign = torch.signbit(x).to(torch.int32) << 7
+    sign = torch.signbit(x).to(torch.int32) * 128
     ax = x.abs()
     # E4M3FN max finite is 448; saturate rather than emit NaN encodings.
     ax = ax.clamp(max=448.0)
     bits = ax.view(torch.int32)
-    exp = ((bits >> 23) & 0xFF) - 127
+    exp = (torch.div(bits, 1 << 23, rounding_mode="floor") & 0xFF) - 127
     mant = bits & 0x7FFFFF
     # min normal = 2^(1-7) = 2^-6; below that, encode as subnormal.
     min_normal_exp = 1 - 7
@@ -239,9 +239,9 @@ def _float_to_e4m3(values: torch.Tensor) -> torch.Tensor:
     # Normal: stored_exp = exp + 7, take top 3 mantissa bits with round-nearest.
     stored_exp = (exp + 7).clamp(0, 15)
     # Round: look at bit 19 (0.5 ULP of 3-bit mantissa in the 23-bit field).
-    round_bit = (mant >> 19) & 1
+    round_bit = torch.div(mant, 1 << 19, rounding_mode="floor") & 1
     sticky = (mant & ((1 << 19) - 1)) != 0
-    mant3 = mant >> 20
+    mant3 = torch.div(mant, 1 << 20, rounding_mode="floor")
     mant3 = mant3 + torch.where(
         (round_bit != 0) & (sticky | ((mant3 & 1) != 0)),
         torch.ones_like(mant3),
@@ -262,7 +262,7 @@ def _float_to_e4m3(values: torch.Tensor) -> torch.Tensor:
     out_exp = torch.where(overflow, torch.full_like(out_exp, 14), out_exp)
     out_mant = torch.where(overflow, torch.full_like(out_mant, 7), out_mant)
     zero = ax == 0
-    code = (out_exp << 3) | out_mant
+    code = (out_exp * 8) | out_mant
     code = torch.where(zero, torch.zeros_like(code), code)
     return (sign | code).to(torch.uint8)
 
@@ -281,7 +281,11 @@ def _pack_rows(rows: torch.Tensor, cache_format: str) -> torch.Tensor:
         scaled = amax.clamp_min(1e-4 if swa else 6 * 2.0**-126)
         scaled = scaled * (1 / (448 if swa else 6))
         bits = scaled.view(torch.int32)
-        exponent = ((bits >> 23) & 255) - 127 + ((bits & 0x7FFFFF) != 0).int()
+        exponent = (
+            (torch.div(bits, 1 << 23, rounding_mode="floor") & 255)
+            - 127
+            + ((bits & 0x7FFFFF) != 0).int()
+        )
         scale_f = torch.exp2(exponent.float())
         scale_bytes = (exponent + 127).to(torch.uint8)
     normalized = x / scale_f.unsqueeze(-1)
@@ -290,7 +294,7 @@ def _pack_rows(rows: torch.Tensor, cache_format: str) -> torch.Tensor:
         values = quant.flatten(1)
     else:
         codes = _e2m1_encode(normalized.reshape(-1, dim)).reshape(-1, dim // 2, 2)
-        values = codes[..., 0] | (codes[..., 1] << 4)
+        values = codes[..., 0] | (codes[..., 1] * 16)
     packed = torch.empty(
         rows.shape[0], row_bytes, dtype=torch.uint8, device=rows.device
     )
@@ -313,7 +317,7 @@ def _unpack_rows(
         scale = torch.where(
             scale_u8 == 0,
             torch.full((), 2.0**-127, device=packed.device),
-            (scale_u8.to(torch.int32) << 23).view(torch.float32),
+            (scale_u8.to(torch.int32) * (1 << 23)).view(torch.float32),
         )
     scale = scale.reshape(*packed.shape[:-1], dim // group)
     if cache_format == "swa":
@@ -361,6 +365,17 @@ def _winning_values(
     count = key.shape[0]
     if count <= 1:
         return values
+    if count <= 64:
+        # Ascend runs integer argsort on AiCpu. Decode writes only a handful of
+        # rows, so an O(N²) device comparison is cheaper than sorting, cummin
+        # and an inverse permutation. Rows without an active duplicate keep
+        # their own (read-back) payload, preserving inactive-slot semantics.
+        position = torch.arange(count, device=key.device)
+        same_key = key.to(torch.int64)[:, None] == key.to(torch.int64)[None, :]
+        priority = torch.where(same_key & active[None, :], position[None, :], -1).amax(
+            dim=1
+        )
+        return values[torch.where(priority >= 0, priority, position)]
     priority = torch.where(
         active,
         torch.arange(count, device=key.device),
@@ -401,8 +416,11 @@ def _transfer_selected(
     """
     if slots.numel() == 0:
         return
-    page = torch.div(slots, _PAGE_ROWS, rounding_mode="floor").to(torch.int64)
-    page_row = torch.remainder(slots, _PAGE_ROWS).to(torch.int64)
+    # Write callers replace inactive slots with slot zero before deriving both
+    # the page/column addresses and the duplicate-resolution key.
+    address_slots = slots
+    page = torch.div(address_slots, _PAGE_ROWS, rounding_mode="floor").to(torch.int64)
+    page_row = torch.remainder(address_slots, _PAGE_ROWS).to(torch.int64)
     n_rows = slots.shape[0]
     for start in range(0, n_rows, _GATHER_ROW_CHUNK):
         stop = min(start + _GATHER_ROW_CHUNK, n_rows)
@@ -412,18 +430,37 @@ def _transfer_selected(
         packed_c = packed_cols[start:stop]
         offsets = page_c.unsqueeze(1) * int(page_stride) + cols_c
         flat_off = offsets.reshape(-1)
-        if not write:
-            packed_c.copy_(flat1d[flat_off].reshape_as(packed_c))
-            continue
-        taken = flat1d[flat_off].reshape_as(packed_c)
         active = (
             live[start:stop]
             if live is not None
             else torch.ones(stop - start, dtype=torch.bool, device=slots.device)
         )
+        if not write:
+            packed_c.copy_(torch.index_select(flat1d, 0, flat_off).reshape_as(packed_c))
+            continue
+        taken = torch.index_select(flat1d, 0, flat_off).reshape_as(packed_c)
         payload = torch.where(active.unsqueeze(1), packed_c, taken)
         key = page_c * _PAGE_ROWS + page_row_c
-        flat1d[flat_off] = _winning_values(key, active, payload).reshape(-1)
+        # Advanced-index and index_copy_ writes are not replayed by Ascend NPU
+        # Graph on this external byte cache. Keep the vendor op in its own file;
+        # the shared CPU/CUDA path retains standard advanced-index assignment.
+        if flat1d.device.type == "npu":
+            from tokenspeed_kernel.ops.attention.dsv41._ascend_codec import (
+                scatter_nd_update_,
+            )
+
+            scatter_nd_update_(
+                flat1d,
+                flat_off,
+                _winning_values(key, active, payload).reshape(-1),
+            )
+        else:
+            flat1d[flat_off] = _winning_values(key, active, payload).reshape(-1)
+
+
+def _write_address_slots(slots: torch.Tensor, live: torch.Tensor) -> torch.Tensor:
+    """Redirect inactive writes to slot zero without aliasing a valid row."""
+    return torch.where(live, slots, torch.zeros_like(slots))
 
 
 def _write_planar(
@@ -436,24 +473,88 @@ def _write_planar(
     _, _, value_bytes, row_bytes = _layout(cache_format)
     scale_bytes = row_bytes - value_bytes
     flat1d, page_stride = _cache_flat1d(cache, row_bytes)
-    _transfer_selected(
-        flat1d,
-        page_stride,
-        slots,
-        _column_indexes(slots, value_bytes, 0),
-        packed[:, :value_bytes],
-        write=True,
-        live=live,
+    address_slots = _write_address_slots(slots, live)
+    cols = torch.cat(
+        (
+            _column_indexes(address_slots, value_bytes, 0),
+            _column_indexes(address_slots, scale_bytes, _PAGE_ROWS * value_bytes),
+        ),
+        dim=1,
     )
     _transfer_selected(
         flat1d,
         page_stride,
-        slots,
-        _column_indexes(slots, scale_bytes, _PAGE_ROWS * value_bytes),
-        packed[:, value_bytes:],
+        address_slots,
+        cols,
+        packed,
         write=True,
         live=live,
     )
+
+
+def _gather_plane(
+    flat1d: torch.Tensor,
+    page_stride: int,
+    page: torch.Tensor,
+    page_row: torch.Tensor,
+    origin: int,
+    width: int,
+) -> torch.Tensor:
+    """Gather ``[rows, width]`` bytes from one in-page plane.
+
+    CANN's byte gather costs about 35 ns per index element on this pool, so a
+    68-byte row read spends its time on index elements rather than on the bytes.
+    Where the plane's width and origin are 8-byte aligned, gathering the same
+    bytes as int64 cuts the index count eightfold. The int64 view only
+    reinterprets bytes; values are unchanged.
+    """
+    if width % 8 == 0 and origin % 8 == 0 and page_stride % 8 == 0:
+        wide = flat1d.view(torch.int64)
+        offsets = (
+            page.unsqueeze(1) * (page_stride // 8)
+            + page_row.unsqueeze(1) * (width // 8)
+            + origin // 8
+            + torch.arange(width // 8, device=flat1d.device, dtype=torch.int64)
+        )
+        gathered = torch.index_select(wide, 0, offsets.reshape(-1))
+        return gathered.view(torch.uint8).reshape(page.shape[0], width)
+    offsets = (
+        page.unsqueeze(1) * page_stride
+        + page_row.unsqueeze(1) * width
+        + origin
+        + torch.arange(width, device=flat1d.device, dtype=torch.int64)
+    )
+    return torch.index_select(flat1d, 0, offsets.reshape(-1)).reshape(
+        page.shape[0], width
+    )
+
+
+def _read_planar_wide(
+    flat1d: torch.Tensor,
+    page_stride: int,
+    slots: torch.Tensor,
+    value_bytes: int,
+    scale_bytes: int,
+    packed: torch.Tensor,
+) -> None:
+    """Read value and scale planes with the widest aligned index elements."""
+    n_rows = slots.shape[0]
+    for start in range(0, n_rows, _GATHER_ROW_CHUNK):
+        stop = min(start + _GATHER_ROW_CHUNK, n_rows)
+        chunk = slots[start:stop].to(torch.int64)
+        page = torch.div(chunk, _PAGE_ROWS, rounding_mode="floor")
+        page_row = torch.remainder(chunk, _PAGE_ROWS)
+        packed[start:stop, :value_bytes] = _gather_plane(
+            flat1d, page_stride, page, page_row, 0, value_bytes
+        )
+        packed[start:stop, value_bytes:] = _gather_plane(
+            flat1d,
+            page_stride,
+            page,
+            page_row,
+            _PAGE_ROWS * value_bytes,
+            scale_bytes,
+        )
 
 
 def _read_planar(
@@ -469,6 +570,25 @@ def _read_planar(
     scale_bytes = row_bytes - value_bytes
     flat1d, page_stride = _cache_flat1d(cache, row_bytes)
     packed = cache.new_empty(slots.shape[0], row_bytes)
+    if (
+        flat1d.device.type == "npu"
+        and flat1d.numel() % 8 == 0
+        and flat1d.storage_offset() % 8 == 0
+        and value_bytes % 8 == 0
+    ):
+        if cache_format == "index" and scale_bytes == 4:
+            # The torch codec is the Ascend leaf; read its index rows directly
+            # instead of dispatching the full dequantizing gather op.
+            from tokenspeed_kernel.ops.attention.dsv41.triton import (
+                cache_read_index_rows,
+            )
+
+            cache_read_index_rows(flat1d, page_stride, slots, packed)
+        else:
+            _read_planar_wide(
+                flat1d, page_stride, slots, value_bytes, scale_bytes, packed
+            )
+        return packed
     # Fuse value+scale into one gather: half the Ascend index launches vs two
     # _transfer_selected reads (gather_global hot path).
     cols = torch.cat(
@@ -551,6 +671,63 @@ def cache_scatter_torch(
     _write_planar(cache, slots, packed, cache_format, live)
 
 
+def cache_scatter_bf16_torch(
+    rows: torch.Tensor,
+    cache: torch.Tensor,
+    slots: torch.Tensor,
+) -> None:
+    """Write BF16 rows to contiguous 512-channel slots in a paged BF16 field.
+
+    This is the dequantized mirror of ``cache_scatter_torch``. Reusing the byte
+    transfer path preserves duplicate/inactive-slot behavior, page strides and
+    Ascend Graph-safe chunked ND updates.
+    """
+    if (
+        rows.ndim != 2
+        or rows.shape[1] != 512
+        or cache.ndim != 3
+        or cache.shape[1:] != (64, 512)
+        or cache.dtype not in (torch.bfloat16, torch.float16)
+        or rows.dtype != cache.dtype
+    ):
+        raise ValueError(
+            "BF16 mirror requires matching [N,512] rows and [P,64,512] cache"
+        )
+    if slots.shape != (rows.shape[0],) or slots.dtype not in (torch.int32, torch.int64):
+        raise ValueError("slots must be integer [N]")
+    if rows.shape[0] == 0:
+        return
+    capacity = cache.shape[0] * _PAGE_ROWS
+    live = (slots >= 0) & (slots < capacity)
+    if cache.device.type == "npu" and cache.dtype == torch.bfloat16:
+        from tokenspeed_kernel.ops.attention.dsv41._ascend_codec import (
+            scatter_bf16_paged_,
+        )
+
+        # One paged-cache scatter replaces the byte-column read-modify-write:
+        # the kernel skips -1 itself, so inactive rows need no read-back, and
+        # duplicate slots are resolved here because the kernel applies them in
+        # an unspecified order. Out-of-range slots must become -1 as well.
+        address_slots = torch.where(live, slots, -1).to(torch.int64)
+        payload = _winning_values(address_slots, live, rows)
+        scatter_bf16_paged_(cache, address_slots, payload)
+        return
+    byte_cache = cache.view(torch.uint8)
+    flat1d, page_stride = _cache_flat1d(byte_cache, 1024)
+    packed = rows.contiguous().view(torch.uint8)
+    address_slots = _write_address_slots(slots, live)
+    cols = _column_indexes(address_slots, 1024, 0)
+    _transfer_selected(
+        flat1d,
+        page_stride,
+        address_slots,
+        cols,
+        packed,
+        write=True,
+        live=live,
+    )
+
+
 def cache_unpack_torch(
     packed: torch.Tensor, cache_format: str, out: torch.Tensor | None
 ) -> torch.Tensor:
@@ -575,3 +752,61 @@ def cache_pack_torch(
         return packed
     out.copy_(packed)
     return out
+
+
+def cache_scatter_with_mirror_torch(
+    rows: torch.Tensor,
+    cache: torch.Tensor,
+    mirror: torch.Tensor,
+    slots: torch.Tensor,
+    cache_format: str,
+) -> torch.Tensor:
+    """Quantize rows into packed pages and mirror the dequantized bytes.
+
+    The mirror must hold what ``cache_gather_torch`` decodes from the pages this
+    call writes, not the pre-quantized rows. Decoding the bytes just packed
+    keeps that guarantee while removing the device read-back: the gather of
+    selected value/scale columns, its LUT expansion and one launch per layer
+    all disappear, and duplicate or inactive slots follow the same
+    read-modify-write rules as the cache write. Returns the rows a gather would
+    decode, so duplicate slots report the winning row and invalid slots read as
+    zero (the mirror itself keeps its previous bytes there).
+    """
+    dim, _, _, row_bytes = _layout(cache_format)
+    if dim != 512:
+        raise ValueError("only 512-channel KV fields have a BF16 page mirror")
+    if (
+        rows.ndim != 2
+        or rows.shape[1] != dim
+        or rows.dtype
+        not in (
+            torch.bfloat16,
+            torch.float32,
+        )
+    ):
+        raise ValueError(f"rows must be BF16/FP32 [N, {dim}]")
+    if slots.shape != (rows.shape[0],) or slots.dtype not in (torch.int32, torch.int64):
+        raise ValueError("slots must be integer [N]")
+    if mirror.ndim != 3 or tuple(mirror.shape[1:]) != (_PAGE_ROWS, dim):
+        raise ValueError(f"mirror must be [pages, {_PAGE_ROWS}, {dim}] BF16 pages")
+    if mirror.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("mirror must be BF16/FP16")
+    if rows.shape[0] == 0:
+        return rows.new_empty((0, dim), dtype=mirror.dtype)
+    capacity = cache.shape[0] * _PAGE_ROWS
+    live = (slots >= 0) & (slots < capacity)
+    packed = _pack_rows(rows, cache_format)
+    _write_planar(cache, slots, packed, cache_format, live)
+    # Duplicate slots store one payload: the last active row wins, and a gather
+    # reports that value for every duplicate. Apply the same rule here so the
+    # returned rows and the mirror agree without re-reading the pages.
+    address_slots = _write_address_slots(slots, live)
+    key = torch.div(address_slots, _PAGE_ROWS, rounding_mode="floor").to(
+        torch.int64
+    ) * _PAGE_ROWS + torch.remainder(address_slots, _PAGE_ROWS).to(torch.int64)
+    mirrored = _winning_values(
+        key, live, _unpack_rows(packed, cache_format, mirror.dtype)
+    )
+    mirrored = mirrored.masked_fill(~live[:, None], 0)
+    cache_scatter_bf16_torch(mirrored, mirror, slots)
+    return mirrored

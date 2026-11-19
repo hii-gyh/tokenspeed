@@ -363,6 +363,12 @@ task cannot relax; the commit's event wait and the non-blocking copies pass
 unflagged, so a report is always a real stall. A deliberate wait off the
 per-round path is wrapped in `allow_host_sync` (`utils/host_sync.py`).
 
+Debug forward attribution follows the same rule. Record accelerator events,
+keep their results in a bounded pending queue, and read elapsed times only
+after a non-blocking completion `query()` on a later forward. Per-layer or
+per-step event/stream synchronization is not an acceptable profiling
+mechanism on the serving thread.
+
 One named exception: a drafter may leave its round pending after the forward
 (`BaseDrafter.finish_round`) and finish it in the next forward's `settle`,
 before `load_round_inputs` (`complete_round`); every other forward-thread task

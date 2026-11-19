@@ -1531,6 +1531,37 @@ def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
     assert swa.total_pages == plan_group.page_count
 
 
+def test_device_regions_are_aligned_for_direct_transfer_registration() -> None:
+    setup = _SyntheticHybridRecipe(
+        layer_types=("full_attention", "sliding_attention"),
+        group_ids=("full_attention", "draft_swa"),
+        num_draft_layers=1,
+        windows=(None, 8),
+        cache_budget_bytes=4_096,
+        probe_batch_rows=None,
+    ).setup()
+    arena = CacheArena(
+        setup.spec.memory_plan,
+        "cpu",
+        cache_group_specs=setup.spec.cache_group_specs,
+        token_capacity=setup.spec.token_capacity,
+    )
+
+    device_regions = {
+        region.region_id: region
+        for region in setup.spec.storage_plan.regions
+        if region.placement == "device"
+    }
+    assert device_regions
+    for region_id, region in device_regions.items():
+        buffer = arena.regions[region_id]
+        assert buffer.data_ptr() % (2 * 1024 * 1024) == 0
+        assert buffer.nbytes == region.size_bytes
+    assert arena.registration_regions() == tuple(
+        (buffer.data_ptr(), buffer.nbytes) for buffer in arena.regions.values()
+    )
+
+
 def test_draft_view_maps_local_layer_ids_to_continuation_planes() -> None:
     """Tripwire for the draft window's DIRECTION and its bounds.
 

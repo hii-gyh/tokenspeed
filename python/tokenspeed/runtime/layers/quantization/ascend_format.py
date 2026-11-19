@@ -124,20 +124,26 @@ def lookup_kind(kinds: dict[str, str], name: str) -> str | None:
     if groups is None:
         return None
     base = name.rsplit(".", 1)[0]
-    for shards in groups:
-        found: set[str] = set()
-        for shard in shards:
-            shard_kind = _direct_kind(kinds, f"{base}.{shard}")
-            if shard_kind is not None:
-                found.add(shard_kind)
-        if not found:
-            continue
-        if len(found) > 1:
-            raise ValueError(
-                f"Mixed Ascend quant labels within fused layer {name}: "
-                f"{sorted(found)}. All members must use the same quantization."
-            )
-        return found.pop()
+    shard_bases = [base]
+    if leaf == "wkv_wgate" and base.endswith(".attn.compressor"):
+        # The compressor consumes the attention module's wkv/wgate shards;
+        # modelslim does not repeat them below a synthetic compressor node.
+        shard_bases.append(base[: -len(".compressor")])
+    for shard_base in shard_bases:
+        for shards in groups:
+            found: set[str] = set()
+            for shard in shards:
+                shard_kind = _direct_kind(kinds, f"{shard_base}.{shard}")
+                if shard_kind is not None:
+                    found.add(shard_kind)
+            if not found:
+                continue
+            if len(found) > 1:
+                raise ValueError(
+                    f"Mixed Ascend quant labels within fused layer {name}: "
+                    f"{sorted(found)}. All members must use the same quantization."
+                )
+            return found.pop()
     return None
 
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 import types
 from pathlib import Path
 
+import pytest
 import torch
 
 _MOE_PATH = (
@@ -59,3 +60,34 @@ def test_expert_row_scales_empty_rows():
     assert _moe.expert_row_scales(weight_scale, counts, rows=0).shape == (0, 4)
     zeros = _moe.expert_row_scales(weight_scale, counts, rows=5)
     assert torch.equal(zeros, torch.zeros(5, 4))
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "npu") or not torch.npu.is_available(),
+    reason="requires an Ascend NPU",
+)
+def test_expert_row_scales_npu_matches_host_in_eager_and_graph():
+    import torch_npu  # noqa: F401
+    from tokenspeed_kernel_npu.ops.moe import expert_row_scales
+
+    weight_scale = torch.arange(4 * 257, dtype=torch.float32).view(4, 257) / 997
+    counts = torch.tensor([2, 0, 3, 1], dtype=torch.int64)
+    expected = _moe.expert_row_scales(weight_scale, counts, rows=10)
+    device = torch.device("npu:0")
+    scale_npu = weight_scale.to(device)
+    counts_npu = counts.to(device)
+
+    observed = expert_row_scales(scale_npu, counts_npu, rows=10)
+    torch.testing.assert_close(observed.cpu(), expected, rtol=0, atol=0)
+
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        captured = expert_row_scales(scale_npu, counts_npu, rows=10)
+    scale_npu.mul_(2.0)
+    counts_npu.copy_(torch.tensor([1, 2, 0, 4], dtype=torch.int64, device=device))
+    expected = _moe.expert_row_scales(
+        weight_scale * 2.0, torch.tensor([1, 2, 0, 4]), rows=10
+    )
+    graph.replay()
+    torch.npu.synchronize()
+    torch.testing.assert_close(captured.cpu(), expected, rtol=0, atol=0)

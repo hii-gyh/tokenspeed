@@ -1,5 +1,7 @@
 # Ascend V4.1 W8A8 serving — tuning handoff
 
+> **Start here for remote access and test execution:** `docs/ascend-v41-w8a8-access-and-test-runbook.md` contains the current SSH, container, launch, benchmark, correctness-gate, profiling, artifact, and safety instructions. This document retains the detailed chronology and evidence history.
+
 **Location:** `docs/ascend-v41-w8a8-serving-handoff.md` (moved from `%TEMP%\e2e_v41_HANDOFF.md`)
 **Branch:** `cursor/ascend-v41-w8a8-serving` (base `main`)
 **Goal:** TokenSpeed vs vLLM-Ascend first on the physically viable **DP2 / TP8 / EP16** two-node topology, then the four-node **DP4 / TP8 / EP32** target and PD if its native runtime is available.

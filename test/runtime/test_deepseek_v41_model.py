@@ -278,6 +278,7 @@ class _Backend:
             V41DecoderView(self.meta, None, (), None, None) if view is None else view
         )
         self.calls = []
+        self.ambient_contexts = []
         self.global_writes = {}
         self.projections = {}
 
@@ -341,6 +342,7 @@ class _Backend:
         key_rows=None,
     ):
         assert key_rows is None
+        self.ambient_contexts.append(v41.current_forward_ctx())
         self.calls.append(
             (
                 layer_id,
@@ -613,7 +615,8 @@ def test_empty_decoder_rows_complete_hc_and_preserve_ep_participation(
         events.append("ffn")
         assert x.shape == (0, config.hidden_size) and mask.shape == (0,)
         assert (total, maximum) == (5, 5)
-        assert ctx is None and comm_manager is None
+        # Layer timing and debug capture still need the context on empty rows.
+        assert comm_manager is None
         return x
 
     monkeypatch.setattr(layer.attn, "forward", attention)
@@ -1516,10 +1519,21 @@ def test_cross_layer_reduction_uses_consumer_norm(monkeypatch, fusion, mode):
         consumer.attn_norm.weight.fill_(0.7)
     consumer.attn_norm.variance_epsilon = 1e-5
     group = (0, 1)
+    mapping = producer.comm_manager.mapping
     monkeypatch.setattr(
         producer.comm_manager,
         "mapping",
-        SimpleNamespace(moe=SimpleNamespace(has_tp_ep=True, tp_ep_group=group)),
+        SimpleNamespace(
+            world_size=mapping.world_size,
+            attn=mapping.attn,
+            dense=mapping.dense,
+            moe=SimpleNamespace(
+                has_tp_ep=True,
+                tp_ep_group=group,
+                tp_size=mapping.moe.tp_size,
+                ep_size=mapping.moe.ep_size,
+            ),
+        ),
     )
     monkeypatch.setattr(producer.comm_manager, "use_all_reduce", lambda *, is_moe: True)
     events = []
@@ -1714,6 +1728,8 @@ def test_attention_owner_cast_index_and_grouped_output(layer_id):
     ctx = _ctx(backend, 6, ForwardMode.EXTEND)
     x = torch.randn(6, 128, dtype=torch.bfloat16)
     actual = attn(positions, x, ctx, reduce_output=True)
+    assert backend.ambient_contexts == [ctx]
+    assert v41.current_forward_ctx() is None
     qr = _norm(
         F.linear(x, attn.wq_a_wkv.weight[: config.q_lora_rank]),
         attn.q_norm.weight,

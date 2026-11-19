@@ -191,11 +191,10 @@ class LayerKindTimingRecorder:
 
 
 @contextmanager
-def layer_kind_scope(ctx: ForwardContext, kind: str, layer_id: int):
+def layer_kind_scope(ctx: ForwardContext | None, kind: str, layer_id: int):
     """Time a model scope when this forward carries an active timer."""
-    timer = ctx.layer_kind_timer
-    if timer is None:
+    if ctx is None or ctx.layer_kind_timer is None:
         yield
         return
-    with timer.scope(kind, layer_id):
+    with ctx.layer_kind_timer.scope(kind, layer_id):
         yield

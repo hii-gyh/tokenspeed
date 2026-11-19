@@ -1182,6 +1182,19 @@ class DeepseekV41Engram(nn.Module):
             original = (original.unflatten(-1, (-1, block.shape[0])) @ block.T).flatten(
                 -2
             )
+        if hidden_states.is_npu and hidden_states.dtype == torch.bfloat16:
+            from tokenspeed_kernel.ops.residual import engram_gate
+
+            return engram_gate(
+                h,
+                original,
+                key,
+                value.float(),
+                self.q_weight.float(),
+                self.k_weight.float(),
+                token_mask,
+                self.eps,
+            ).to(hidden_states.dtype)
         weight = self.q_weight.float() * self.k_weight.float()
         rstd = torch.rsqrt(original.square().mean(-1) + self.eps) * torch.rsqrt(
             key.square().mean(-1) + self.eps

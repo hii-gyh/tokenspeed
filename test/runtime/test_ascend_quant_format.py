@@ -174,9 +174,12 @@ def test_w8a8_linear_dequant_matches_the_scale_and_offset():
     )
     assert layer.weight.dtype == torch.int8
     layer.weight_loader(layer.weight, torch.tensor([[2, 0], [0, 4]], dtype=torch.int8))
-    layer.weight_loader(layer.weight_scale, torch.tensor([0.5, 0.25]))
-    layer.weight_loader(layer.weight_offset, torch.tensor([1, 0], dtype=torch.int8))
-    output = layer(torch.tensor([[1.0, 1.0]], dtype=torch.bfloat16))
+    layer.weight_scale.weight_loader(layer.weight_scale, torch.tensor([0.5, 0.25]))
+    layer.weight_offset.weight_loader(
+        layer.weight_offset, torch.tensor([1, 0], dtype=torch.int8)
+    )
+    output, output_bias = layer(torch.tensor([[1.0, 1.0]], dtype=torch.bfloat16))
+    assert output_bias is None
     # row 0: (2-1)*0.5=0.5, (0-1)*0.5=-0.5; row 1: 0, 4*0.25=1
     # [1, 1] dotted with those rows is 0 and 1
     torch.testing.assert_close(output.float(), torch.tensor([[0.0, 1.0]]))

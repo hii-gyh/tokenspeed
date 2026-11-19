@@ -656,6 +656,48 @@ def cache_gather(cache, slots, cache_format, out):
     return _gather(cache, slots, cache_format, out)
 
 
+@triton.jit(do_not_specialize=["P0", "S0"])
+def _read_index_rows_kernel(CACHE, SCALECACHE, SLOTS, VALUES, SCALES, P0, S0):
+    """Read index value rows as int64 and scale rows as int32."""
+    row = tl.program_id(0).to(tl.int64)
+    slot = tl.load(SLOTS + row * S0).to(tl.int64)
+    page = slot // 64
+    page_row = slot % 64
+    channels = tl.arange(0, 8)
+    cache_base = CACHE + page * P0
+    value = tl.load(cache_base + page_row * 8 + channels)
+    # One index scale row is four FP8 exponents, exactly one little-endian word.
+    scale = tl.load(SCALECACHE + page * (P0 * 2) + 64 * 16 + page_row)
+    tl.store(VALUES + row * 8 + channels, value)
+    tl.store(SCALES + row, scale)
+
+
+def cache_read_index_rows(
+    flat1d: torch.Tensor,
+    page_stride: int,
+    slots: torch.Tensor,
+    packed: torch.Tensor,
+) -> None:
+    """Read packed 68-byte index rows without CANN's large GatherV3."""
+    if flat1d.numel() % 8 or flat1d.storage_offset() % 8 or page_stride % 8:
+        raise ValueError("Index row reading requires an 8-byte-aligned arena")
+    if packed.shape != (slots.shape[0], 68) or packed.dtype != torch.uint8:
+        raise ValueError("Index row output must be uint8 [N,68]")
+    values = packed.new_empty((slots.shape[0], 64))
+    scales = packed.new_empty((slots.shape[0], 4))
+    _read_index_rows_kernel[(slots.shape[0],)](
+        flat1d.view(torch.int64),
+        flat1d.view(torch.int32),
+        slots,
+        values.view(torch.int64),
+        scales.view(torch.int32),
+        page_stride // 8,
+        slots.stride(0),
+    )
+    packed[:, :64].copy_(values)
+    packed[:, 64:].copy_(scales)
+
+
 @triton.jit
 def _compressor_tail_scatter_kernel(
     Content,
@@ -1418,6 +1460,42 @@ def index_topk(
                 block_out[start:end],
                 block_lens[start:end],
             )
+    return out
+
+
+@triton.jit(do_not_specialize=["HALF", "T0", "T1", "T2"])
+def _compressor_tail_rows(TAIL, PAGE, ROW, HALF, OUT, T0, T1, T2):
+    """Read one contiguous FP32 tail row per program without a giant GatherV3."""
+    out_row = tl.program_id(0).to(tl.int64)
+    page = tl.load(PAGE + out_row).to(tl.int64)
+    row = tl.load(ROW + out_row).to(tl.int64)
+    channels = tl.arange(0, 512)
+    # Page, row, and the output row all scale with runtime counts. Widen before
+    # multiplying so large arenas cannot wrap their offsets at int32.
+    tail_offset = page * T0 + row * T1 + HALF * T2
+    values = tl.load(TAIL + tail_offset + channels)
+    tl.store(OUT + out_row * 512 + channels, values)
+
+
+def compressor_tail_rows(
+    tail: torch.Tensor,
+    page: torch.Tensor,
+    row: torch.Tensor,
+    half: int,
+) -> torch.Tensor:
+    """Gather FP32 ``[N,512]`` rows from the ratio-2 compressor tail arena."""
+    out = tail.new_empty((page.shape[0], 512))
+    if page.shape[0]:
+        _compressor_tail_rows[(page.shape[0],)](
+            tail,
+            page,
+            row,
+            half,
+            out,
+            tail.stride(0),
+            tail.stride(1),
+            tail.stride(2),
+        )
     return out
 
 

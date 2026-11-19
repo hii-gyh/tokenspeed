@@ -26,8 +26,8 @@ the control plane's profile requests and the note of each committed forward
 and ``num_steps`` count forwards, and the attention-TP peers rendezvous over
 a CPU group around each trace they write.
 
-Profilers: torch (CPU, GPU), CUDA_PROFILER, MEM snapshots, EXPERT_LOAD
-counters, viztracer and Proton. Proton must be driven from the scheduler
+Profilers: torch (CPU, GPU, Ascend NPU), CUDA_PROFILER, MEM snapshots,
+EXPERT_LOAD counters, viztracer and Proton. Proton must be driven from the scheduler
 process, not the frontend: its GPU hooks are per process, and the process
 is torn down with SIGKILL, so an atexit-based finalize would never write the
 profile.
@@ -35,6 +35,7 @@ profile.
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 from pathlib import Path
@@ -85,6 +86,22 @@ def _all_thread_profile_config():
         raise RuntimeError(str(exc)) from exc
 
 
+def _load_npu_profiler():
+    """Load torch_npu's profiler only when an Ascend capture is requested."""
+    try:
+        return importlib.import_module("torch_npu").profiler
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError("torch_npu profiler is unavailable") from exc
+
+
+def _npu_experimental_config(npu_profiler):
+    """Collect kernel shapes and AIC/AIV pipeline utilization on Ascend."""
+    return npu_profiler._ExperimentalConfig(
+        profiler_level=npu_profiler.ProfilerLevel.Level1,
+        aic_metrics=npu_profiler.AiCMetrics.PipeUtilization,
+    )
+
+
 class Profiler:
     """Profiling state and its start/stop, for one scheduler process.
 
@@ -112,10 +129,23 @@ class Profiler:
         self._profile_sync_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
         self.init_profiler()
 
+    @property
+    def _device_type(self) -> str:
+        """Read the handle dynamically so forward reload needs no reinit."""
+        return "cpu" if self._device is None else self._device.device_type
+
     def note_forward(self, forward_mode: ForwardMode) -> None:
         """Count one committed forward and start or stop the profiler at the
         step a request asked for."""
         self.forward_ct += 1
+        if (
+            self._device_type == "npu"
+            and self.profile_in_progress
+            and self.torch_profiler is not None
+        ):
+            # Close the just-committed forward before a predicate can stop or
+            # replace the session. The final stop adds one schedule-only step.
+            self.torch_profiler.step()
         self._profile_batch_predicate(forward_mode)
 
     def init_profiler(self):
@@ -127,6 +157,7 @@ class Profiler:
         self.profiler_target_forward_ct: int | None = None
         self.profiler_target_prefill_ct: int | None = None
         self.profiler_target_decode_ct: int | None = None
+        self.profiler_num_steps: int | None = None
         self.profiler_prefill_ct: int | None = None
         self.profiler_decode_ct: int | None = None
         self.profile_by_stage: bool = False
@@ -222,13 +253,24 @@ class Profiler:
                 )
 
         if {"CPU", "GPU"} & set(activities):
-            try:
-                _all_thread_profile_config()
-            except RuntimeError as exc:
-                return ProfileReqOutput(
-                    success=False,
-                    message=f"This PyTorch runtime cannot provide all-thread phase profiling: {exc}",
-                )
+            if self._device_type == "npu":
+                if num_steps is None or num_steps < 1:
+                    return ProfileReqOutput(
+                        success=False,
+                        message="NPU profiling requires a positive num_steps so its schedule can finish cleanly.",
+                    )
+                try:
+                    _npu_experimental_config(_load_npu_profiler())
+                except RuntimeError as exc:
+                    return ProfileReqOutput(success=False, message=str(exc))
+            else:
+                try:
+                    _all_thread_profile_config()
+                except RuntimeError as exc:
+                    return ProfileReqOutput(
+                        success=False,
+                        message=f"This PyTorch runtime cannot provide all-thread phase profiling: {exc}",
+                    )
 
         self.profile_by_stage = profile_by_stage
         self.profiler_output_dir = output_dir
@@ -236,6 +278,7 @@ class Profiler:
         self.torch_profiler_record_shapes = record_shapes
         self.profiler_activities = activities
         self.profile_id = profile_id
+        self.profiler_num_steps = num_steps
 
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.forward_ct + 1)
@@ -268,15 +311,42 @@ class Profiler:
         with_stack = self.torch_profiler_with_stack
         record_shapes = self.torch_profiler_record_shapes
 
-        activity_map = {
-            "CPU": torch.profiler.ProfilerActivity.CPU,
-            "GPU": torch.profiler.ProfilerActivity.CUDA,
-        }
-        torchprof_activities = [
-            activity_map[a] for a in activities if a in activity_map
-        ]
+        torchprof_activities = [a for a in activities if a in ("CPU", "GPU")]
 
-        if torchprof_activities:
+        if torchprof_activities and self._device_type == "npu":
+            try:
+                npu_profiler = _load_npu_profiler()
+                activity_map = {
+                    "CPU": npu_profiler.ProfilerActivity.CPU,
+                    "GPU": npu_profiler.ProfilerActivity.NPU,
+                }
+                Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
+                self.torch_profiler = npu_profiler.profile(
+                    activities=[activity_map[a] for a in torchprof_activities],
+                    with_stack=with_stack if with_stack is not None else False,
+                    record_shapes=(
+                        record_shapes if record_shapes is not None else False
+                    ),
+                    experimental_config=_npu_experimental_config(npu_profiler),
+                    schedule=npu_profiler.schedule(
+                        wait=0,
+                        warmup=0,
+                        active=self.profiler_num_steps,
+                        repeat=1,
+                        skip_first=0,
+                    ),
+                    on_trace_ready=npu_profiler.tensorboard_trace_handler(
+                        self.profiler_output_dir
+                    ),
+                )
+                self.torch_profiler.start()
+            except Exception as exc:
+                self.torch_profiler = None
+                return ProfileReqOutput(
+                    success=False,
+                    message=f"Failed to start NPU profiling: {exc}",
+                )
+        elif torchprof_activities:
             try:
                 experimental_config = _all_thread_profile_config()
             except RuntimeError as exc:
@@ -285,7 +355,13 @@ class Profiler:
                     message=f"This PyTorch runtime cannot provide all-thread phase profiling: {exc}",
                 )
             self.torch_profiler = torch.profiler.profile(
-                activities=torchprof_activities,
+                activities=[
+                    {
+                        "CPU": torch.profiler.ProfilerActivity.CPU,
+                        "GPU": torch.profiler.ProfilerActivity.CUDA,
+                    }[a]
+                    for a in torchprof_activities
+                ],
                 with_stack=with_stack if with_stack is not None else True,
                 record_shapes=record_shapes if record_shapes is not None else False,
                 experimental_config=experimental_config,
@@ -377,13 +453,19 @@ class Profiler:
         logger.info(f"Stop profiling{stage_suffix!s}...")
 
         if self.torch_profiler is not None:
-            self.torch_profiler.stop()
-            self.torch_profiler.export_chrome_trace(
-                os.path.join(
-                    self.profiler_output_dir,
-                    f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.trace.json.gz",
+            if self._device_type == "npu":
+                # Cross the active window without running another forward;
+                # tensorboard_trace_handler then writes ASCEND_PROFILER_OUTPUT.
+                self.torch_profiler.step()
+                self.torch_profiler.stop()
+            else:
+                self.torch_profiler.stop()
+                self.torch_profiler.export_chrome_trace(
+                    os.path.join(
+                        self.profiler_output_dir,
+                        f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.trace.json.gz",
+                    )
                 )
-            )
             self._profile_sync()
 
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:

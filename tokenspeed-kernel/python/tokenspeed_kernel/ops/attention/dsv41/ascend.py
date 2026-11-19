@@ -30,7 +30,9 @@ import torch
 from tokenspeed_kernel.ops.attention.dsv41.cache_codec_torch import (
     cache_gather_torch,
     cache_pack_torch,
+    cache_scatter_bf16_torch,
     cache_scatter_torch,
+    cache_scatter_with_mirror_torch,
     cache_unpack_torch,
 )
 from tokenspeed_kernel.ops.attention.dsv41.compressor_torch import (
@@ -43,8 +45,10 @@ from tokenspeed_kernel.ops.attention.dsv41.pages import (
     a2_cmp_topk,
     adapt_flatkv_decode_selections,
     align_pa_block_for_a2,
+    as_pa_bbnd,
     decode_cu_seqlens_q,
     host_seqused_max,
+    lcm_block_table_as_pa,
     pad_sparse_indices,
     prefill_workspace_selections,
     repeat_query_heads,
@@ -68,10 +72,10 @@ if current_platform().is_npu:
     _FP32_SIG = frozenset({format_signature(x=dense_tensor_format(torch.float32))})
     _BYTE_SIG = frozenset({format_signature(x=dense_tensor_format(torch.uint8))})
     _BF16_SIG = frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))})
-    # The metadata kernel writes 1024 int32s. That buffer already holds the
-    # full per-core schedule (36 cube records of 9 and 72 vector records of 8).
-    # Zero-filling another length changes that stride.
-    _SPARSE_MLA_METADATA_LEN = 1024
+    # CANN 9.2.1 allocates 2048 int32s for SparseFlashMla metadata. Use the
+    # toolkit binding with the same allocation and kernel contract; the older
+    # vLLM _C_ascend binding in some images still allocates 1024 entries.
+    _SPARSE_MLA_METADATA_LEN = 2048
     # The A2 example launches 64 query heads. TP ranks may hold fewer; the
     # vector tiles are 16-wide, so repeat up to the example width and slice back.
     _SPARSE_MLA_QUERY_HEADS = 64
@@ -327,6 +331,8 @@ if current_platform().is_npu:
             cmp_mask_mode=cmp_mask_mode,
             ori_win_left=win_left,
             ori_win_right=win_right,
+            layout_q="TND",
+            layout_kv="PA_BBND",
             has_ori_kv=True,
             has_cmp_kv=has_cmp,
         )
@@ -359,11 +365,136 @@ if current_platform().is_npu:
                 cmp_mask_mode=cmp_mask_mode,
                 ori_win_left=win_left,
                 ori_win_right=win_right,
+                layout_q="TND",
+                layout_kv="PA_BBND",
             )
             return attended
 
         out = _attend(metadata)
         return out[:, :live_heads]
+
+    def ascend_paged_attention_from_bf16(
+        q,
+        *,
+        swa_cache,
+        swa_block_table,
+        seq_lens,
+        global_cache,
+        global_block_table,
+        global_sparse_indices,
+        attn_sink,
+        softmax_scale: float,
+        cmp_ratio: int,
+        context_len: int,
+    ):
+        """Attend directly from BF16 LCM pages without materializing selections.
+
+        Tables and logical sparse indices address the existing 64-row pages.
+        ``context_len`` supplies static graph-safe metadata bounds; no device
+        reduction or host synchronization is needed. The optional compressed
+        cache must be supplied with both its table and logical top-k indices.
+        """
+        if q.ndim != 3 or q.shape[-1] != 512:
+            raise ValueError("paged sparse MLA query must be [tokens, heads, 512]")
+        if context_len < 1:
+            raise ValueError("paged sparse MLA context_len must be positive")
+        tokens = q.shape[0]
+        live_heads = q.shape[1]
+        has_cmp = global_cache is not None
+        if has_cmp != (global_block_table is not None) or has_cmp != (
+            global_sparse_indices is not None
+        ):
+            raise ValueError(
+                "compressed pages, table and indices must be supplied together"
+            )
+        if cmp_ratio not in (0, 1, 2) or (not has_cmp and cmp_ratio != 0):
+            raise ValueError(
+                "cmp_ratio must be 1/2 with compressed KV, or 0 without it"
+            )
+        for name, table in (("SWA", swa_block_table), ("global", global_block_table)):
+            if table is not None and (table.ndim != 2 or table.shape[0] != tokens):
+                raise ValueError(f"{name} paged table must be [tokens, blocks]")
+
+        q, sinks = repeat_query_heads(q, attn_sink, _SPARSE_MLA_QUERY_HEADS)
+        seqused_ori = seq_lens.to(torch.int32).reshape(-1).contiguous()
+        seqused_cmp = None
+        residual = None
+        cmp_sparse = None
+        cmp_table = None
+        cmp_topk = 0
+        max_seqlen_cmp = 0
+        if has_cmp:
+            if cmp_ratio not in (1, 2):
+                raise ValueError("compressed paged attention requires cmp_ratio=1 or 2")
+            seqused_cmp = torch.div(
+                seqused_ori, cmp_ratio, rounding_mode="floor"
+            ).contiguous()
+            if cmp_ratio == 2:
+                residual = (seqused_ori % 2).contiguous()
+            cmp_sparse = pad_sparse_indices(global_sparse_indices, 512)
+            cmp_table = lcm_block_table_as_pa(global_block_table)
+            cmp_topk = 512
+            max_seqlen_cmp = context_len
+        ori_max = host_seqused_max(seqused_ori)
+        cmp_max = host_seqused_max(seqused_cmp)
+        if ori_max == 0 and cmp_max == 0:
+            return q.new_zeros((tokens, live_heads, q.shape[-1]))
+
+        cu_seqlens_q = decode_cu_seqlens_q(tokens, device=q.device)
+        metadata = _metadata_from_kernel(
+            npu_sparse_flash_mla_metadata(
+                q.shape[1],
+                1,
+                q.shape[-1],
+                cu_seqlens_q=cu_seqlens_q,
+                seqused_ori_kv=seqused_ori,
+                seqused_cmp_kv=seqused_cmp,
+                cmp_residual_kv=residual,
+                batch_size=tokens,
+                max_seqlen_q=1,
+                max_seqlen_ori_kv=context_len,
+                max_seqlen_cmp_kv=max_seqlen_cmp,
+                ori_topk=0,
+                ori_topk_length=None,
+                cmp_topk=cmp_topk,
+                cmp_ratio=cmp_ratio,
+                ori_mask_mode=4,
+                cmp_mask_mode=3 if has_cmp else 0,
+                ori_win_left=127,
+                ori_win_right=0,
+                layout_q="TND",
+                layout_kv="PA_BBND",
+                has_ori_kv=True,
+                has_cmp_kv=has_cmp,
+            )
+        )
+        attended, _ = npu_sparse_flash_mla(
+            q,
+            ori_kv=as_pa_bbnd(swa_cache),
+            cmp_kv=None if not has_cmp else as_pa_bbnd(global_cache),
+            ori_sparse_indices=None,
+            ori_topk_length=None,
+            cmp_sparse_indices=cmp_sparse,
+            ori_block_table=lcm_block_table_as_pa(swa_block_table),
+            cmp_block_table=cmp_table,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_ori_kv=seqused_ori,
+            seqused_cmp_kv=seqused_cmp,
+            cmp_residual_kv=residual,
+            sinks=sinks,
+            metadata=metadata,
+            softmax_scale=softmax_scale,
+            cmp_ratio=cmp_ratio,
+            ori_mask_mode=4,
+            cmp_mask_mode=3 if has_cmp else 0,
+            ori_win_left=127,
+            ori_win_right=0,
+            layout_q="TND",
+            layout_kv="PA_BBND",
+            topk_value_mode=1,
+            return_softmax_lse=False,
+        )
+        return attended[:, :live_heads]
 
     def swa_lens_as_seqused(topk_length: torch.Tensor) -> torch.Tensor:
         """Flatten ``[T, 1]`` topk lengths to the ``[T]`` seqused vector."""
@@ -448,6 +579,39 @@ if current_platform().is_npu:
     )
     def ascend_dsv41_cache_scatter(rows, cache, slots, cache_format):
         cache_scatter_torch(rows, cache, slots, cache_format)
+
+    # PIN: the mirror write decodes the bytes this call packed instead of
+    # reading them back from the device cache. Same bytes, one launch less.
+    @register_kernel(
+        "attention",
+        "dsv41_cache_scatter_with_mirror",
+        name="ascend_dsv41_cache_scatter_with_mirror",
+        solution="torch_npu",
+        capability=_CAPABILITY,
+        signatures=_BF16_SIG | _FP32_SIG,
+        traits={},
+        priority=Priority.SPECIALIZED,
+        features={"ascend", "flatkv"},
+    )
+    def ascend_dsv41_cache_scatter_with_mirror(
+        rows, cache, mirror, slots, cache_format
+    ):
+        return cache_scatter_with_mirror_torch(rows, cache, mirror, slots, cache_format)
+
+    @register_kernel(
+        "attention",
+        "dsv41_cache_scatter_bf16",
+        name="ascend_dsv41_cache_scatter_bf16",
+        solution="torch_npu",
+        capability=_CAPABILITY,
+        signatures=_BF16_SIG,
+        traits={},
+        priority=Priority.SPECIALIZED,
+        features={"ascend", "flatkv"},
+    )
+    def ascend_dsv41_cache_scatter_bf16(rows, cache, slots):
+        """Write dequantized rows to the direct-attention BF16 page mirror."""
+        cache_scatter_bf16_torch(rows, cache, slots)
 
     @register_kernel(
         "attention",

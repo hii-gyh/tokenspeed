@@ -34,6 +34,7 @@ from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.debug_tensor_capture import DebugTensorSink
     from tokenspeed.runtime.execution.dspark_context import (
         DSparkContextProducer,
     )
@@ -224,6 +225,10 @@ class ForwardContext:
     # Carries the active LayerKindTimer so decoder layers can mark attn/MLP
     # sub-phases without process-global state.
     layer_kind_timer: LayerKindTimer | None = None
+
+    # Offline eager numerics capture. The sink copies any tensor it keeps;
+    # the context itself never owns tensor buffers. None in production and graphs.
+    debug_tensor_sink: DebugTensorSink | None = None
 
 
 @contextmanager

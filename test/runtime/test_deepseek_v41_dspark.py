@@ -99,6 +99,12 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             self.layer_id = layer_id
             self.layer_hash_index = layer_id - 37
 
+        def embed(self, hashes, *, out_device):
+            return None
+
+        def hold_prepared(self, prepared):
+            assert prepared is None
+
         def forward(self, hidden, hashes, mask, *, query_shard=None):
             assert query_shard is None
             events.append(("engram", self.layer_id))
@@ -110,6 +116,8 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
         def __init__(self, layer_id):
             super().__init__()
             self.layer_id = layer_id
+            self.comm_manager = SimpleNamespace(mapping=_mapping(0, 1, 1))
+            self.ffn = SimpleNamespace(owns_ep_communication=False)
             self.engram = Engram(layer_id) if layer_id >= 37 else None
 
         def forward(
@@ -152,7 +160,10 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
     )
     target.model.ced_decoder_start = 20
     target.model.decoder_uses_engram = True
+    target.model._layer_kind_timing = v41.LayerKindTimingRecorder(rank=0)
+    target.model._debug_tensor_capture = v41.DebugTensorCaptureRecorder(rank=0)
     target.model.layers = nn.ModuleList(Layer(i) for i in range(40))
+    target.model.embed_tokens = nn.Embedding(1, 2)
     target.model.norm = SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-6)
     target.set_dspark_layers_to_capture([37, 38, 39])
     assert target.model.dspark_capture_layers == (37, 38, 39)

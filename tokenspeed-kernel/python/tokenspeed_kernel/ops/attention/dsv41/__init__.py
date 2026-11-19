@@ -76,6 +76,8 @@ __all__ = [
     "cache_pack",
     "cache_unpack",
     "cache_scatter",
+    "cache_scatter_bf16",
+    "cache_scatter_with_mirror",
     "cache_gather",
     "index_q_quantize",
     "index_key_norm_rope",
@@ -244,6 +246,35 @@ def cache_scatter(
     may be strided. No page-table mapping or model preprocessing is performed.
     """
     return _kernel("cache_scatter", rows)(rows, cache, slots, cache_format)
+
+
+def cache_scatter_bf16(
+    rows: torch.Tensor,
+    cache: torch.Tensor,
+    slots: torch.Tensor,
+) -> None:
+    """Write dequantized rows to a BF16 paged direct-attention mirror."""
+    return _kernel("cache_scatter_bf16", rows)(rows, cache, slots)
+
+
+def cache_scatter_with_mirror(
+    rows: torch.Tensor,
+    cache: torch.Tensor,
+    mirror: torch.Tensor,
+    slots: torch.Tensor,
+    cache_format: str,
+) -> torch.Tensor:
+    """Quantize ``rows`` into paged ``cache`` and write their mirror in one call.
+
+    ``mirror`` is the BF16 direct-attention page field holding the dequantized
+    form of the same slots, so it matches a ``cache_gather`` of ``cache`` byte
+    for byte while the device read-back is skipped. ``slots`` follow the same
+    negative/out-of-capacity skip rules as ``cache_scatter``. Returns the
+    mirrored rows ``[N, D]``, which is also what ``cache_gather`` would decode.
+    """
+    return _kernel("cache_scatter_with_mirror", rows)(
+        rows, cache, mirror, slots, cache_format
+    )
 
 
 def cache_gather(

@@ -164,11 +164,50 @@ def test_duplicate_slot_keeps_the_later_row():
     assert torch.equal(got, expect)
 
 
-def test_chunk_pages_keep_the_byte_offset_inside_int32():
-    stride = 64 * 528
-    pages = _mod._chunk_pages(stride)
-    assert pages * stride <= 2**31 - 1
-    assert (pages + 1) * stride > 2**31 - 1
+@pytest.mark.parametrize("fmt,dim,row_bytes", [("global", 512, 288), ("swa", 512, 528)])
+def test_scatter_with_mirror_equals_the_scatter_then_gather_mirror(fmt, dim, row_bytes):
+    """The fused call must leave cache and mirror exactly as the two-step path."""
+    torch.manual_seed(7)
+    rows = torch.randn(3, dim, dtype=torch.bfloat16)
+    slots = torch.tensor([1, 65, 2], dtype=torch.int64)
+    packed_cache = torch.zeros(2, 64, row_bytes, dtype=torch.uint8)
+    packed_mirror = torch.zeros(2, 64, dim, dtype=torch.bfloat16)
+    mirrored = _mod.cache_scatter_with_mirror_torch(
+        rows, packed_cache, packed_mirror, slots, fmt
+    )
+
+    # The returned rows are what a later gather decodes from the same pages.
+    gathered = _mod.cache_gather_torch(packed_cache, slots, fmt, None)
+    assert torch.equal(mirrored, gathered)
+    assert torch.equal(packed_mirror.reshape(-1, dim)[slots], gathered)
+
+    # And both tensors match the explicit write-then-read-back sequence.
+    step_cache = torch.zeros_like(packed_cache)
+    step_mirror = torch.zeros_like(packed_mirror)
+    _mod.cache_scatter_torch(rows, step_cache, slots, fmt)
+    _mod.cache_scatter_bf16_torch(
+        _mod.cache_gather_torch(step_cache, slots, fmt, None), step_mirror, slots
+    )
+    assert torch.equal(packed_cache, step_cache)
+    assert torch.equal(packed_mirror, step_mirror)
+
+
+def test_scatter_with_mirror_skips_invalid_slots_and_keeps_the_later_duplicate():
+    fmt, dim, row_bytes = "swa", 512, 528
+    torch.manual_seed(8)
+    rows = torch.randn(3, dim, dtype=torch.bfloat16)
+    cache = torch.zeros(1, 64, row_bytes, dtype=torch.uint8)
+    untouched = torch.full((1, 64, dim), 7.0, dtype=torch.bfloat16)
+    mirror = untouched.clone()
+    slots = torch.tensor([4, -1, 4], dtype=torch.int64)
+    mirrored = _mod.cache_scatter_with_mirror_torch(rows, cache, mirror, slots, fmt)
+
+    # Duplicate slot keeps the later row, exactly as the cache write does.
+    assert torch.equal(mirrored, _mod.cache_gather_torch(cache, slots, fmt, None))
+    assert torch.equal(mirror.reshape(-1, dim)[4:5], mirrored[2:3])
+    # An invalid slot neither writes the cache nor disturbs the mirror.
+    assert torch.equal(mirror.reshape(-1, dim)[0], untouched.reshape(-1, dim)[0])
+    assert int(cache[0, 0].sum()) == 0
 
 
 def test_selected_byte_offsets_stay_int64_past_2gb():
@@ -282,6 +321,19 @@ def _soft_f32_to_e4m3fn_u8(x: torch.Tensor) -> torch.Tensor:
     return ((sign << 7) | code).to(torch.uint8)
 
 
+def test_scatter_bf16_skips_invalid_slots_without_aliasing_valid_rows():
+    torch.manual_seed(9)
+    rows = torch.randn(3, 512, dtype=torch.bfloat16)
+    cache = torch.full((1, 64, 512), 7.0, dtype=torch.bfloat16)
+    before = cache.clone()
+    slots = torch.tensor([63, -1, 10_000], dtype=torch.int64)
+    _mod.cache_scatter_bf16_torch(rows, cache, slots)
+    assert torch.equal(cache[0, 63], rows[0])
+    untouched = torch.ones(64, dtype=torch.bool)
+    untouched[63] = False
+    assert torch.equal(cache[0, untouched], before[0, untouched])
+
+
 def test_soft_e4m3_encode_matches_torch_float8_cast():
     torch.manual_seed(6)
     vals = torch.cat(
@@ -291,6 +343,8 @@ def test_soft_e4m3_encode_matches_torch_float8_cast():
             torch.tensor([0.0, 448.0, -448.0, 2**-9, 2**-6, 240.0, 256.0, 288.0]),
         ]
     )
-    expect = vals.to(torch.float8_e4m3fn).view(torch.uint8)
+    # The software encoder explicitly saturates to finite E4M3 values. Clamp
+    # before the torch cast because ARM and x86 disagree on overflow-to-NaN.
+    expect = vals.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(torch.uint8)
     got = _soft_f32_to_e4m3fn_u8(vals)
     assert torch.equal(got, expect)

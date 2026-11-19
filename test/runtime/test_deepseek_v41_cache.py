@@ -38,6 +38,7 @@ from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     DeepseekV41AttentionBackend,
     V41CompressorPlan,
     V41PrefillSpan,
+    V41Selection,
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import DeepseekV41Config
@@ -251,6 +252,88 @@ def test_rebinding_cache_pool_drops_pool_derived_state():
     backend.end_indexer_forward()
     backend.init_cuda_graph_state(2, max_tokens_per_req=1, overlap_schedule_depth=1)
     assert backend._decode_buffers is not old_buffers
+
+
+def test_ascend_paged_indices_reuse_is_scoped_to_selection(monkeypatch):
+    backend = _backend("cpu", 1)
+    backend.init_forward_metadata_capture_cuda_graph(
+        1,
+        torch.zeros(1, dtype=torch.int64),
+        torch.ones(1, dtype=torch.int32),
+        ForwardMode.DECODE,
+        block_tables=_tables("cpu"),
+        num_tokens=1,
+    )
+    meta = backend.query_metadata(ForwardMode.DECODE)
+    global_slots = torch.zeros((1, 4), dtype=torch.int32)
+    global_lens = torch.ones((1, 4), dtype=torch.int32)
+    selection = V41Selection(
+        owner=2,
+        source=2,
+        positions=meta.positions,
+        request_indices=meta.request_indices,
+        logical_rows=global_slots,
+        lengths=global_lens,
+        candidates=None,
+        physical_slots=global_slots,
+    )
+    monkeypatch.setattr(backend.cache_pool, "swa_bf16", lambda layer: object())
+    monkeypatch.setattr(backend.cache_pool, "global_bf16", lambda owner: object())
+
+    def unexpected_gather(*args):
+        raise AssertionError("direct paged attention must not gather selected rows")
+
+    observed = []
+
+    def fake_attention(q, **kwargs):
+        observed.append(kwargs)
+        value = float(kwargs["global_sparse_indices"].sum())
+        return torch.full_like(q, value)
+
+    monkeypatch.setattr(dsv41, "cache_gather", unexpected_gather)
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.dsv41.ascend."
+        "ascend_paged_attention_from_bf16",
+        fake_attention,
+    )
+    q = torch.zeros((1, 2, 512), dtype=torch.bfloat16)
+
+    def run(current):
+        return backend._forward_v41_ascend_decode(
+            q,
+            object(),
+            meta.swa_read_slots,
+            meta.swa_read_lens,
+            object(),
+            global_slots,
+            global_lens,
+            None,
+            1.0,
+            layer_id=0,
+            owner=2,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.DECODE,
+            selection=current,
+        )
+
+    first = run(selection)
+    second = run(selection)
+    assert len(observed) == 2
+    assert observed[0]["global_sparse_indices"] is global_slots
+    assert observed[1]["global_sparse_indices"] is global_slots
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+    assert selection.ascend_global_indices is global_slots
+
+    refreshed_rows = torch.ones_like(global_slots)
+    third = run(
+        replace(
+            selection,
+            logical_rows=refreshed_rows,
+            ascend_global_indices=None,
+        )
+    )
+    assert observed[-1]["global_sparse_indices"] is refreshed_rows
+    torch.testing.assert_close(third, torch.full_like(third, 4), rtol=0, atol=0)
 
 
 def _tables(device):
@@ -1036,6 +1119,23 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
     )
     layout = _layout(recipe)
     assert layout.lcm_block_bytes == 1_382_400 and len(layout.fields) == 51
+
+    # Ascend direct attention adds one BF16 page for every quantized SWA/global
+    # page and accounts for those bytes in scheduler-visible parent capacity.
+    recipe.attn_config = replace(config, device="npu")
+    npu_layout = _layout(recipe)
+    assert len(npu_layout.fields) == 95
+    assert npu_layout.lcm_block_bytes > layout.lcm_block_bytes
+    npu_fields = {field.field_id: field for field in npu_layout.fields}
+    for layer in range(40):
+        field = npu_fields[f"layer.{layer}.swa_bf16"]
+        assert field.shape == (64, 512) and field.dtype == "bfloat16"
+    for owner in (2, 8, 14, 20):
+        field = npu_fields[f"layer.{owner}.global_bf16"]
+        assert field.shape == (64, 512) and field.dtype == "bfloat16"
+    recipe.check_layout(npu_layout)
+    recipe.attn_config = config
+
     specs = {spec.group_id: spec for spec, _ in recipe.groups()}
     horizon = (1 + overlap_depth) * verify_width
     # Retention is the attention window (or the pair) whatever the verify
@@ -2237,7 +2337,18 @@ def test_gpu_replayed_rows_attend_from_the_window_start_only():
     torch.cuda.synchronize()
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
 def test_prefill_plan_reuses_addresses_and_refresh_rechecks_pages(device):
     backend = _backend(device, 2)
     tables = _tables(device)
@@ -2272,7 +2383,18 @@ def test_prefill_plan_reuses_addresses_and_refresh_rechecks_pages(device):
     assert not backend._swa_plans
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
 def test_prefill_plan_distinguishes_reordered_subset_and_checks_dependencies(device):
     backend = _backend(device, 2)
     tables = _tables(device)
@@ -2310,7 +2432,15 @@ def test_prefill_plan_distinguishes_reordered_subset_and_checks_dependencies(dev
 
 @pytest.mark.parametrize("position", [0, 126, 127, 128, None])
 def test_native_decode_receives_compact_window_and_real_lengths(monkeypatch, position):
+    from tokenspeed_kernel import platform as kernel_platform
     from tokenspeed_kernel.ops.attention import dsv41
+
+    # This test pins the native compact-attention contract even when the test
+    # host happens to have torch_npu installed; Ascend paged reads have their
+    # own dedicated contract test above.
+    monkeypatch.setattr(
+        kernel_platform, "current_platform", lambda: SimpleNamespace(is_npu=False)
+    )
 
     backend = _backend("cpu", 2)
     tables = _tables("cpu")
@@ -2473,7 +2603,18 @@ def test_gpu_compressor_pool_preserves_fp32_math_and_dynamic_graph_inputs(count)
             torch.testing.assert_close(out, reference(), rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
 def test_compressor_plan_shared_owners_and_reused_tail_page(device, monkeypatch):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -2536,7 +2677,18 @@ def test_compressor_plan_shared_owners_and_reused_tail_page(device, monkeypatch)
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("verify_width", [1, 3, 5, 6])
 @pytest.mark.parametrize("decode_prefix", [8, 9])
 def test_mixed_compressor_plan_windows_match_combined_pooling(
@@ -2598,7 +2750,18 @@ def test_mixed_compressor_plan_windows_match_combined_pooling(
         torch.testing.assert_close(value, original, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
 def test_compressor_plan_ragged_windows_rebase_only_predecessors(device):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
@@ -3493,6 +3656,10 @@ def test_projected_indexer_queries_are_not_sliced_twice(projected, deferred):
     record = backend.sparse_topk.prefill
     assert record.positions is meta.positions
     assert record.request_indices is meta.request_indices
+    prepared = backend._prepared_selections[
+        (2, ForwardMode.EXTEND, id(meta.positions), id(meta.request_indices))
+    ]
+    assert prepared[3] is record
 
 
 @pytest.mark.parametrize("size", [1, 4, 8])

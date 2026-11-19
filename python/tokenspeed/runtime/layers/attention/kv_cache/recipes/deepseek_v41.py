@@ -54,6 +54,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecip
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     CacheLayout,
+    pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupDeclaration,
@@ -81,6 +82,11 @@ class DeepseekV41Recipe(CacheRecipe):
     def _row_layout(self):
         """Return the row widths and packing the configured cache format uses."""
         return self.attn_config.component(DeepseekV41Config).row_layout()
+
+    def _direct_paged_bf16(self) -> bool:
+        # CANN SparseFlashMla reads BF16 PA_BBND pages directly but rejects the
+        # quantized uint8 fields. Only Ascend pays for the dequantized mirrors.
+        return self.attn_config.device == "npu"
 
     @property
     @override
@@ -182,6 +188,8 @@ class DeepseekV41Recipe(CacheRecipe):
 
         for layer in range(self.num_target_layers):
             add(V41_SWA_GROUP_ID, layer, "swa", (64, rows.swa_row_bytes), "uint8")
+            if self._direct_paged_bf16():
+                add(V41_SWA_GROUP_ID, layer, "swa_bf16", (64, V41_HEAD_DIM), "bfloat16")
         # The draft reads each stage's window with the target's SWA slots, so
         # the rows live in the SWA group; the last target layer owns the field
         # ids, so PD and L2 treat them as target state produced with that layer.
@@ -199,6 +207,8 @@ class DeepseekV41Recipe(CacheRecipe):
             )
             add(gid, owner, "global_kv", (64, rows.global_row_bytes), "uint8")
             add(gid, owner, "index_k", (64, rows.index_row_bytes), "uint8")
+            if self._direct_paged_bf16():
+                add(gid, owner, "global_bf16", (64, V41_HEAD_DIM), "bfloat16")
             if ratios[owner] == 2:
                 add(
                     V41_COMPRESSOR_TAIL_GROUP_ID,
@@ -247,11 +257,34 @@ class DeepseekV41Recipe(CacheRecipe):
             specs = apply_pd_transfer_policies(specs)
         return tuple((spec, tuple(fields[spec.group_id])) for spec in specs)
 
+    def _direct_packed_layout(self) -> CacheLayout:
+        # The BF16 mirrors make SWA the dominant group. This repacking shares
+        # one 4,147,200-byte parent with <5% padding in every group; merely
+        # adding mirror bytes to the quantized parent over-allocates the tiny
+        # compressor-tail group and violates its stride budget.
+        packing = {
+            V41_SWA_GROUP_ID: 1,
+            V41_GLOBAL_R2_GROUP_ID: 15,
+            V41_GLOBAL_R1_GROUP_ID: 45,
+            V41_COMPRESSOR_TAIL_GROUP_ID: 162,
+        }
+        return pack(
+            self.groups(),
+            prefix_granularity=self.prefix_granularity,
+            cache_blocks_per_lcm_block=packing,
+            alignment=self.alignment,
+            max_padding_fraction=self.max_padding_fraction,
+        )
+
     def _group_packing(self) -> Mapping[str, int]:
+        if self._direct_paged_bf16():
+            return dict(self._direct_packed_layout().group_packing)
         rows = self._row_layout()
         return rows.dspark_group_packing if self.dspark_stages() else rows.group_packing
 
     def _lcm_block_bytes(self) -> int:
+        if self._direct_paged_bf16():
+            return self._direct_packed_layout().lcm_block_bytes
         rows = self._row_layout()
         return (
             rows.dspark_lcm_block_bytes

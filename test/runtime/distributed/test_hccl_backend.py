@@ -41,6 +41,26 @@ def test_hccl_all_reduce_uses_hccl_process_group(monkeypatch):
     )
 
 
+def test_all_gather_single_uses_public_torch_collective(monkeypatch):
+    process_group = Mock()
+    monkeypatch.setattr(
+        hccl_module.pg_manager,
+        "get_process_group",
+        Mock(return_value=process_group),
+    )
+    output = torch.zeros(4)
+    input = torch.arange(4, dtype=torch.float32)
+
+    def gather(actual_output, actual_input, *, group):
+        assert group is process_group
+        actual_output.copy_(actual_input + 1)
+
+    monkeypatch.setattr(hccl_module.dist, "all_gather_into_tensor", gather)
+    HcclBackend().all_gather_single(output, input, (0, 1))
+
+    torch.testing.assert_close(output, input + 1, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("shape", [(), (1,), (7,), (3, 5), (512,)])
 @pytest.mark.parametrize("ranks", [2, 3, 8])
 @pytest.mark.parametrize("contiguous", [True, False])
@@ -160,9 +180,9 @@ def test_token_reduce_scatter_preserves_rows_and_skips_equal_shard_packing(
         # Simulate reduction of identical peer inputs, selecting this rank's chunk.
         output.copy_(input.chunk(len(counts))[current_rank] * len(counts))
 
-    # Older torch-npu deployments install this collective alias at startup.
+    # Use the public Torch collective on every supported torch-npu release.
     monkeypatch.setattr(
-        hccl_module.dist, "reduce_scatter_single", reduce_scatter, raising=False
+        hccl_module.dist, "reduce_scatter_tensor", reduce_scatter, raising=False
     )
     monkeypatch.setattr(hccl_module.dist, "get_rank", lambda: group[current_rank])
     for current_rank in range(len(counts)):
@@ -176,7 +196,7 @@ def test_token_reduce_scatter_preserves_rows_and_skips_equal_shard_packing(
 def test_single_rank_token_reduce_scatter_needs_no_collective(monkeypatch):
     reduce_scatter = Mock()
     monkeypatch.setattr(
-        hccl_module.dist, "reduce_scatter_single", reduce_scatter, raising=False
+        hccl_module.dist, "reduce_scatter_tensor", reduce_scatter, raising=False
     )
     tensor = torch.ones(8, 4)
     output = HcclBackend().token_reduce_scatter(tensor, (2,), [8])

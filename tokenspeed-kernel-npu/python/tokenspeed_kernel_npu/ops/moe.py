@@ -813,22 +813,16 @@ def ascend_bf16_distributed_precomputed_moe_apply(
     return torch.cat(outputs, dim=0)
 
 
-def _ascend_int8_expert_gmm_from_bf16(
-    expanded: torch.Tensor,
+def _ascend_int8_expert_gmm(
+    values: torch.Tensor,
+    activation_scale: torch.Tensor,
     expert_counts: torch.Tensor,
     w: torch.nn.Module,
     plan: dict,
 ) -> torch.Tensor:
-    """Dynamic-quant BF16 tokens through local INT8 NZ expert GMMs."""
-    if expanded.numel() == 0:
-        return expanded
-    values, activation_scale = torch_npu.npu_dynamic_quant(expanded)
-    smooth13 = getattr(w, "w13_smooth_scale", None)
-    if smooth13 is not None:
-        # Per-token scales already absorbed activation; smooth is folded in
-        # the weight path for local routing. Distributed BF16 dispatch has no
-        # smooth quant; keep dynamic token scales only.
-        del smooth13
+    """Run local INT8 NZ expert GMMs on tokens quantized by MC2 dispatch."""
+    if values.numel() == 0:
+        return values.to(torch.bfloat16)
     hidden = torch_npu.npu_grouped_matmul(
         [values],
         [w.w13_weight],
@@ -875,7 +869,7 @@ def ascend_int8_distributed_precomputed_moe_apply(
     low_latency: bool | None = None,
     overlap_fn=None,
 ) -> torch.Tensor:
-    """Ascend MC2 dispatch of BF16 tokens, then local INT8 NZ expert GMMs."""
+    """Ascend INT8 MC2 dispatch followed by local INT8 NZ expert GMMs."""
     del router_logits, enable_pdl, low_latency
     if overlap_fn is not None:
         raise ValueError("Ascend distributed MoE does not support overlap_fn")
@@ -971,13 +965,13 @@ def ascend_int8_distributed_precomputed_moe_apply(
             shared_expert_rank_num=0,
             zero_expert_num=num_zero_experts,
             copy_expert_num=num_copy_experts,
-            quant_mode=0,
+            quant_mode=2,
             global_bs=global_bs,
             expert_token_nums_type=1,
-            comm_alg="fullmesh",
+            comm_alg="",
         )
-        hidden = _ascend_int8_expert_gmm_from_bf16(
-            dispatch[0], dispatch[3], chunk, plan
+        hidden = _ascend_int8_expert_gmm(
+            dispatch[0], dispatch[1], dispatch[3], chunk, plan
         )
         outputs.append(
             torch_npu.npu_moe_distribute_combine_v2(
@@ -1002,7 +996,7 @@ def ascend_int8_distributed_precomputed_moe_apply(
                 copy_expert_num=num_copy_experts,
                 global_bs=global_bs,
                 comm_quant_mode=0,
-                comm_alg="fullmesh",
+                comm_alg="",
             )
         )
     return torch.cat(outputs, dim=0)

@@ -238,7 +238,8 @@ def test_probe_uses_demand_and_reports_resident_bytes_with_zero_budget():
         resident_cache_window=(0, 2), synchronize_capacity=local_cache_capacity
     )
     resident = setup.spec.memory_plan.narrow_to_layers(0, 2)
-    assert resident.num_lcm_blocks == 3
+    # Three probe rows plus the reserved null parent.
+    assert resident.num_lcm_blocks == 4
     assert setup.cache_budget_bytes == resident.arena_bytes
 
 

@@ -132,3 +132,53 @@ def test_cache_scatter_torch_duplicate_slots_keep_last(fmt: str):
     )
     after = cache_gather_torch(cache, torch.tensor([7], dtype=torch.int32), fmt, None)
     torch.testing.assert_close(after, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_cache_scatter_torch_mixed_duplicate_and_inactive_slots(fmt: str):
+    """Small-row writes must not borrow an active row for an inactive slot."""
+    torch.manual_seed(13)
+    dim = {"swa": 512, "global": 512, "index": 128}[fmt]
+    row_bytes = {"swa": 528, "global": 288, "index": 68}[fmt]
+    cache = torch.zeros(4, _PAGE_ROWS, row_bytes, dtype=torch.uint8)
+    rows = torch.randn(4, dim, dtype=torch.bfloat16)
+    cache_scatter_torch(rows[:1], cache, torch.tensor([7], dtype=torch.int32), fmt)
+    before = cache_gather_torch(cache, torch.tensor([7], dtype=torch.int32), fmt, None)
+
+    cache_scatter_torch(
+        rows,
+        cache,
+        torch.tensor([5, 5, 6, -1], dtype=torch.int32),
+        fmt,
+    )
+    got = cache_gather_torch(
+        cache, torch.tensor([5, 6, 7], dtype=torch.int32), fmt, None
+    )
+    expect = cache_unpack_torch(cache_pack_torch(rows[1:3], fmt, None), fmt, None)
+    torch.testing.assert_close(got[:2], expect, rtol=0, atol=0)
+    torch.testing.assert_close(got[2], before[0], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fmt", _FORMATS)
+def test_cache_scatter_torch_inactive_slot_preserves_active_slot_zero(fmt: str):
+    """The safe inactive destination must not overwrite a real slot-zero row."""
+    torch.manual_seed(17)
+    dim = {"swa": 512, "global": 512, "index": 128}[fmt]
+    row_bytes = {"swa": 528, "global": 288, "index": 68}[fmt]
+    cache = torch.zeros(4, _PAGE_ROWS, row_bytes, dtype=torch.uint8)
+    rows = torch.randn(4, dim, dtype=torch.bfloat16)
+    slots = torch.tensor([0, -1, 0, -1], dtype=torch.int32)
+
+    cache_scatter_torch(rows, cache, slots, fmt)
+    got = cache_gather_torch(cache, torch.tensor([0], dtype=torch.int32), fmt, None)
+    expect = cache_unpack_torch(cache_pack_torch(rows[2:3], fmt, None), fmt, None)
+    torch.testing.assert_close(got, expect, rtol=0, atol=0)
+
+    cache_scatter_torch(
+        rows,
+        cache,
+        torch.tensor([-1, -1, -1, -1], dtype=torch.int32),
+        fmt,
+    )
+    after = cache_gather_torch(cache, torch.tensor([0], dtype=torch.int32), fmt, None)
+    torch.testing.assert_close(after, expect, rtol=0, atol=0)

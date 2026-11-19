@@ -40,14 +40,23 @@ def silu_and_mul(
 ) -> torch.Tensor:
     """Apply SwiGLU through the platform implementation.
 
-    Positive ``limit`` values use the portable Triton implementation because
-    the CUDA implementation does not expose the checkpoint's clamp semantics.
+    Positive ``limit`` values use the portable Triton implementation on CUDA,
+    whose fused activation does not expose the checkpoint's clamp semantics;
+    Ascend has a clipped SwiGLU kernel that does.
 
     """
-    if current_platform().is_npu and limit is None:
-        from tokenspeed_kernel.ops.activation.ascend import silu_and_mul as npu_swiglu
+    if current_platform().is_npu:
+        if limit is None:
+            from tokenspeed_kernel.ops.activation.ascend import (
+                silu_and_mul as npu_swiglu,
+            )
 
-        return npu_swiglu(x, out)
+            return npu_swiglu(x, out)
+        from tokenspeed_kernel.ops.activation.ascend import (
+            silu_and_mul_clamped as npu_clipped_swiglu,
+        )
+
+        return npu_clipped_swiglu(x, limit, out)
     if (
         limit is not None
         or current_platform().is_amd
