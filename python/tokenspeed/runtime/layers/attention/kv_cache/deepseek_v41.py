@@ -79,12 +79,20 @@ class DeepseekV41CachePool(CachePool):
         """Return layer's page-planar uint8 [pages, 64, R] FP8 values/E8M0 scales."""
         return self._field(layer, "swa")
 
+    def swa_bf16(self, layer: int) -> torch.Tensor:
+        """Return the dequantized BF16 [pages, 64, 512] direct-attention mirror."""
+        return self._field(layer, "swa_bf16")
+
     def global_kv(self, owner: int) -> torch.Tensor:
         """Return owner's page-planar uint8 [pages, 64, R] quantized values/scales.
 
         Pass the KV source layer, not a Reuse/Reindex consumer layer.
         """
         return self._field(owner, "global_kv")
+
+    def global_bf16(self, owner: int) -> torch.Tensor:
+        """Return the owner's dequantized BF16 global page mirror."""
+        return self._field(owner, "global_bf16")
 
     def index_k(self, owner: int) -> torch.Tensor:
         """Return owner's uint8 [pages, 64, 68] page-planar FP4 values/E8M0 scales.

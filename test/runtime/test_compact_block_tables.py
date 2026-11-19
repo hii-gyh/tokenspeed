@@ -427,3 +427,22 @@ def test_legacy_and_window_views_are_read_only_and_outlive_the_batch():
     gc.collect()
     np.testing.assert_array_equal(absolute, absolute_before)
     np.testing.assert_array_equal(window, window_before)
+
+
+def test_packing_falls_back_to_absolute_arrays_without_windows_api():
+    """Older ts-host embeds a scheduler Batch without windows/spans."""
+    from tokenspeed.runtime.engine.scheduler_utils import (
+        packed_block_tables_from_forward_op,
+    )
+
+    absolute = {
+        "full": np.array([[1, 2, -1], [3, 4, 5]], dtype=np.int32),
+        "swa": np.array([[7, 8], [0, 9]], dtype=np.int32),
+    }
+    legacy_op = SimpleNamespace(block_tables_arrays=lambda: absolute)
+    packed = packed_block_tables_from_forward_op(
+        legacy_op, "cpu", host_tables=True, num_reqs=2
+    )
+    for group_id, expected in absolute.items():
+        np.testing.assert_array_equal(packed.tables_cpu[group_id].numpy(), expected)
+        np.testing.assert_array_equal(packed.tables[group_id].cpu().numpy(), expected)

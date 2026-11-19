@@ -78,6 +78,10 @@ class IndexMetadata:
         self.history_rows = history_rows
         self.paged = {}
         self.sparse = {}
+        # Ascend's torch scorer shares dequantized keys between layers that use
+        # this exact invocation geometry. The cache tensor is held by each
+        # entry, so an id cannot be reused for a different owner while alive.
+        self.torch_keys = {}
 
     def validate(self, table, lengths):
         if self.source.tensors[0] is not table or self.source.tensors[1] is not lengths:

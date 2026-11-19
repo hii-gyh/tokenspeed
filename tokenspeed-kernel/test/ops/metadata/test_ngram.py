@@ -142,7 +142,7 @@ def test_ngram_preparation(bs, max_length, graph, device, uniform):
         torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("device", ["cpu", "cuda", "npu"])
 @pytest.mark.parametrize("graph", [False, True])
 @pytest.mark.parametrize("num_extends", [0, 2, 4])
 @pytest.mark.parametrize("repeat", [1, 1250])
@@ -151,6 +151,13 @@ def test_commit_ngram_independent_reference(graph, num_extends, device, repeat):
 
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
+    if device == "npu":
+        if not hasattr(torch, "npu") or not torch.npu.is_available():
+            pytest.skip("requires Ascend NPU")
+        if graph:
+            pytest.skip("NPU commit uses the host reference, not a device graph")
+        if repeat > 1:
+            pytest.skip("NPU host-commit coverage uses the small batch only")
     if graph and device == "cpu":
         pytest.skip("CUDA graph")
     bs, capacity, pool = 4 * repeat, 10 * repeat, 5 * repeat
@@ -584,3 +591,48 @@ def test_ngram_hash_matches_reference_at_production_scale():
     prepare_ngram_inputs(*gpu, prefix, hashes, tokens, vocab, tokens, gpu_params)
     expected = params.hash(ids, gpu[9].cpu(), gpu[10].cpu())
     torch.testing.assert_close(hashes.cpu(), expected, rtol=0, atol=0)
+
+
+def test_host_replay_matches_the_cpu_reference():
+    from tokenspeed_kernel.ops.metadata.ngram import _prepare_ngram_inputs_on_host
+
+    bs, total, capacity, vocab, pool = 2, 3, 5, 128, 4
+    params = hash_params("cpu")
+    snapshots = torch.tensor([[1, 2, 3, 4], [5, -1, 6, 7]], dtype=torch.int64)
+    positions = torch.tensor([100, 101])
+    reset = torch.tensor([True, False])
+    slots = torch.tensor([1, 0])
+    cache = torch.tensor([100, 101, 200, 200], dtype=torch.int32)
+    ends = torch.tensor([1, 3], dtype=torch.int32)
+    tail = torch.tensor([[8, 9, 10], [11, 12, 13], [-1, -1, -1], [1, 2, 3]])
+    needs_seed = torch.tensor([False, True, False, False])
+    ids = torch.tensor([4, 5, 6, 7, 8], dtype=torch.int32)
+    previous = torch.full((capacity, 3), 777, dtype=torch.int64)
+    mask = torch.ones(capacity, dtype=torch.bool)
+    prefix = torch.empty((bs, 3), dtype=torch.int64)
+    hashes = torch.empty((capacity, 2, 6), dtype=torch.int64)
+    args = (
+        snapshots,
+        positions,
+        reset,
+        slots,
+        cache,
+        ends,
+        tail,
+        needs_seed,
+        ids,
+        previous.clone(),
+        mask.clone(),
+        prefix.clone(),
+        hashes.clone(),
+        total,
+        vocab,
+        0,
+        params,
+    )
+    direct = [t.clone() if isinstance(t, torch.Tensor) else t for t in args]
+    prepare_ngram_inputs(*direct)
+    replay = [t.clone() if isinstance(t, torch.Tensor) else t for t in args]
+    _prepare_ngram_inputs_on_host(*replay)
+    for got, ref in zip(replay[9:13], direct[9:13], strict=True):
+        torch.testing.assert_close(got, ref, rtol=0, atol=0)

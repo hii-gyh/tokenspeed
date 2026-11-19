@@ -39,6 +39,31 @@ def silu_and_mul(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tens
     return result
 
 
+def silu_and_mul_clamped(
+    x: torch.Tensor, limit: float, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """SwiGLU with the checkpoint's clamp, through CANN's clipped SwiGLU.
+
+    ``gate = min(gate, limit)``, ``up = clamp(up, -limit, limit)`` and
+    ``out = gate * sigmoid(gate) * up``. CANN's defaults are the OAI variant
+    (alpha 1.702, bias 1.0, interleaved halves), so every one of them is pinned
+    here to the plain SwiGLU this model uses.
+    """
+    if limit <= 0:
+        raise ValueError(f"limit must be positive, got {limit}")
+    if x.numel() == 0:
+        if out is not None:
+            return out
+        return x.new_empty(x.shape[:-1] + (x.shape[-1] // 2,))
+    result = torch_npu.npu_clipped_swiglu(
+        x, dim=-1, alpha=1.0, limit=float(limit), bias=0.0, interleaved=False
+    )
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
 def dequant_silu_and_mul_quant(x, weight_scale, activation_scale):
     """Dequantize INT32 [gate,up], apply SwiGLU and dynamically quantize rows."""
     if x.numel() == 0:

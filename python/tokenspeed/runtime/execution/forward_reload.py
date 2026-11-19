@@ -57,9 +57,10 @@ RELOADABLE_PACKAGES = (
     "tokenspeed.runtime.sampling",
     "tokenspeed_kernel.ops",
     "tokenspeed_kernel.thirdparty",
+    "tokenspeed_kernel_npu.ops",
 )
 # Packages watched for edits; an edited module outside RELOADABLE_PACKAGES needs a restart.
-TRACKED_PACKAGES = ("tokenspeed.runtime", "tokenspeed_kernel")
+TRACKED_PACKAGES = ("tokenspeed.runtime", "tokenspeed_kernel", "tokenspeed_kernel_npu")
 
 
 def _reloadable(name: str) -> bool:

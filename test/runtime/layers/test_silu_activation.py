@@ -96,3 +96,18 @@ def test_npu_silu_and_mul_graph_replay(dtype):
     graph.replay()
     torch.npu.synchronize()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_npu_clamped_silu_skips_forward_native(monkeypatch):
+    """V4.1 shared experts set swiglu_limit; NPU must not use the fp32 native path."""
+    if not current_platform().is_npu:
+        pytest.skip("requires an Ascend NPU")
+
+    def boom(self, x):
+        raise AssertionError("NPU clamped SiluAndMul must not call forward_native")
+
+    monkeypatch.setattr(SiluAndMul, "forward_native", boom)
+    x = torch.randn(4, 64, device="npu", dtype=torch.bfloat16)
+    out = SiluAndMul(swiglu_limit=7.0)(x)
+    assert out.shape == (4, 32)
+    assert out.device.type == "npu"

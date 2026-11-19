@@ -473,6 +473,7 @@ class ServerArgs:
     log_level: str = "info"
     enable_async_logging: bool = False
     enable_log_request_stats: bool = False
+    ttft_trace_sampling_percentage: int = 0
     enable_metrics: bool = False
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
@@ -1181,6 +1182,10 @@ class ServerArgs:
                 self.sampling_backend = "flashinfer"
             elif current_platform().is_npu:
                 self.sampling_backend = "ascend_full"
+                # vLLM-Ascend and the trainer build YaRN inv-freq on the host;
+                # NPU division of the ramp table rounds differently at ulp level.
+                if self.yarn_ramp_mask_device == "cuda":
+                    self.yarn_ramp_mask_device = "cpu"
             else:
                 self.sampling_backend = "greedy"
 
@@ -2740,6 +2745,13 @@ class ServerArgs:
             )
 
     def validate(self):
+        if (
+            type(self.ttft_trace_sampling_percentage) is not int
+            or not 0 <= self.ttft_trace_sampling_percentage <= 100
+        ):
+            raise ValueError(
+                "--ttft-trace-sampling-percentage must be an integer in [0, 100]"
+            )
         self.validate_weight_memory_policy()
         self.validate_forward_reload()
         if self.low_latency_max_num_tokens_per_gpu <= 0:
@@ -3015,6 +3027,8 @@ class ServerArgs:
                 "nvfp4",
                 "w8a8_fp8",
                 "compressed-tensors",
+                # Ascend modelslim W8A8; registered as AscendQuantConfig.
+                "ascend",
             ],
             help="The quantization method.",
         )
@@ -3429,6 +3443,12 @@ class ServerArgs:
             help="The logging level of all loggers.",
         )
         parser.add_argument(
+            "--ttft-trace-sampling-percentage",
+            type=int,
+            default=ServerArgs.ttft_trace_sampling_percentage,
+            help="Log engine TTFT phases for this percentage of PD bootstrap rooms (0 disables).",
+        )
+        parser.add_argument(
             "--enable-log-request-stats",
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.enable_log_request_stats,
@@ -3685,10 +3705,18 @@ class ServerArgs:
             metavar="ALL2ALL_BACKEND",
             type=str,
             default=ServerArgs.all2all_backend,
-            choices=["none", "agrs", "deepep", "flashinfer", "gluon_petit"],
+            choices=[
+                "none",
+                "ascend",
+                "agrs",
+                "deepep",
+                "flashinfer",
+                "gluon_petit",
+            ],
             help="MoE communication backend. agrs and flashinfer explicitly select "
             "the Kimi-K3 attention-DP transport; gluon_petit selects the fused "
-            "Petit MegaMoE transport; none preserves existing behavior.",
+            "Petit MegaMoE transport; ascend is the Ascend wide-EP HCCL path "
+            "(same as none for dispatch selection); none preserves existing behavior.",
         )
         parser.add_argument(
             "--deepep-mode",

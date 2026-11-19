@@ -1,4 +1,5 @@
 import gzip
+import importlib.util
 import json
 import os
 import subprocess
@@ -31,12 +32,12 @@ def _attn_mapping(tp_rank: int = 0, dp_rank: int | None = None) -> SimpleNamespa
     )
 
 
-def _make_handler(attn_mapping: SimpleNamespace | None = None) -> Profiler:
+def _make_handler(attn_mapping: SimpleNamespace | None = None, device=None) -> Profiler:
     attn_mapping = attn_mapping or _attn_mapping()
     return Profiler(
         # EXPERT_LOAD is refused under --enable-eplb; plain serving here.
         server_args=SimpleNamespace(enable_eplb=False),
-        device=None,
+        device=device,
         attn_mapping=attn_mapping,
         # Two peers, so _profile_sync rendezvouses (tests patch it).
         sync_size=getattr(attn_mapping, "tp_size", 2),
@@ -191,7 +192,7 @@ class TestRequestHandlerProtonProfile:
                 try:
                     with (
                         mock.patch.object(torch.cuda, '_lazy_init', side_effect=deny('torch.cuda._lazy_init')),
-                        mock.patch.object(torch._C, '_cuda_init', side_effect=deny('torch._C._cuda_init')),
+                        mock.patch.object(torch._C, '_cuda_init', side_effect=deny('torch._C._cuda_init'), create=True),
                         mock.patch.object(torch.cuda, 'is_available', return_value=False),
                         mock.patch.object(torch.cuda, 'device_count', return_value=0),
                         mock.patch.object(torch.cuda, 'current_device', side_effect=AssertionError('hardware discovery forbidden')),
@@ -227,6 +228,10 @@ class TestRequestHandlerProtonProfile:
                     print(json.dumps({'canary_end': audit}), flush=True)
                 raise SystemExit(status)
             """)
+            if importlib.util.find_spec("tokenspeed_triton") is None:
+                pytest.skip(
+                    "CPU canary requires the optional tokenspeed_triton package"
+                )
             environment = _canary_child_environment(
                 os.environ,
                 expected_handler=str(Path(profiler_mod.__file__).resolve()),
@@ -710,6 +715,144 @@ class TestRequestHandlerExpertLoadProfile:
         assert ("--enable-eplb") in (result.message)
         assert not (self.handler.profile_in_progress)
         self.device.reset_expert_load.assert_not_called()
+
+
+class _FakeNpuProfilerSession:
+    def __init__(self, kwargs):
+        self.kwargs = kwargs
+        self.started = 0
+        self.steps = 0
+        self.stopped = 0
+
+    def start(self):
+        self.started += 1
+
+    def step(self):
+        self.steps += 1
+
+    def stop(self):
+        self.stopped += 1
+
+
+class _FakeNpuProfilerAPI:
+    ProfilerActivity = SimpleNamespace(CPU="CPU", NPU="NPU")
+    ProfilerLevel = SimpleNamespace(Level1="Level1")
+    AiCMetrics = SimpleNamespace(PipeUtilization="PipeUtilization")
+
+    def __init__(self):
+        self.sessions = []
+
+    def _ExperimentalConfig(self, **kwargs):
+        return kwargs
+
+    def schedule(self, **kwargs):
+        return kwargs
+
+    def tensorboard_trace_handler(self, output_dir):
+        return ("trace_handler", output_dir)
+
+    def profile(self, **kwargs):
+        session = _FakeNpuProfilerSession(kwargs)
+        self.sessions.append(session)
+        return session
+
+
+class TestRequestHandlerNpuProfile:
+    """Ascend capture uses the real control flow with only hardware mocked."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, request):
+        self.output_dir = tempfile.mkdtemp()
+        self.api = _FakeNpuProfilerAPI()
+        self.handler = _make_handler(device=SimpleNamespace(device_type="npu"))
+        self.handler.attn_tp_size = 1
+        loader = mock.patch.object(
+            profiler_mod, "_load_npu_profiler", return_value=self.api
+        )
+        loader.start()
+        request.addfinalizer(loader.stop)
+
+    def _start(self, **kwargs) -> ProfileReq:
+        options = {
+            "output_dir": self.output_dir,
+            "activities": ["CPU", "GPU"],
+            "profile_id": "ascend",
+            "num_steps": 10,
+            **kwargs,
+        }
+        return ProfileReq(type=ProfileReqType.START_PROFILE, **options)
+
+    def test_decode_capture_finishes_schedule_and_writes_through_handler(self):
+        with mock.patch.object(
+            profiler_mod.torch.profiler,
+            "profile",
+            side_effect=AssertionError("legacy CUDA profiler must not be used"),
+        ):
+            result = self.handler.profile(self._start())
+        assert result.success
+        for _ in range(10):
+            self.handler.note_forward(ForwardMode.DECODE)
+
+        assert len(self.api.sessions) == 1
+        session = self.api.sessions[0]
+        assert session.started == 1
+        assert session.steps == 11
+        assert session.stopped == 1
+        assert session.kwargs["activities"] == ["CPU", "NPU"]
+        assert session.kwargs["schedule"] == {
+            "wait": 0,
+            "warmup": 0,
+            "active": 10,
+            "repeat": 1,
+            "skip_first": 0,
+        }
+        assert session.kwargs["experimental_config"] == {
+            "profiler_level": "Level1",
+            "aic_metrics": "PipeUtilization",
+        }
+        assert session.kwargs["on_trace_ready"] == (
+            "trace_handler",
+            self.output_dir,
+        )
+        assert not self.handler.profile_in_progress
+        assert self.handler.torch_profiler is None
+
+    def test_stage_capture_creates_prefill_and_decode_sessions(self):
+        result = self.handler.profile(self._start(profile_by_stage=True, num_steps=1))
+        assert result.success
+        self.handler.note_forward(ForwardMode.EXTEND)
+        self.handler.note_forward(ForwardMode.EXTEND)
+        self.handler.note_forward(ForwardMode.DECODE)
+        self.handler.note_forward(ForwardMode.DECODE)
+
+        assert len(self.api.sessions) == 2
+        assert [session.steps for session in self.api.sessions] == [2, 2]
+        assert [session.stopped for session in self.api.sessions] == [1, 1]
+        assert not self.handler.profile_in_progress
+
+    def test_npu_capture_requires_a_bounded_schedule(self):
+        before = self.handler.profiler_num_steps
+        result = self.handler.profile(self._start(num_steps=None))
+        assert not result.success
+        assert "positive num_steps" in result.message
+        assert self.handler.profiler_num_steps == before
+        assert not self.handler.profile_in_progress
+        assert self.api.sessions == []
+
+    def test_npu_output_failure_is_rejected_without_starting_capture(self):
+        with mock.patch.object(
+            profiler_mod.Path,
+            "mkdir",
+            side_effect=OSError(30, "Read-only file system"),
+        ):
+            result = self.handler.profile(self._start())
+
+        assert not result.success
+        assert "Failed to start NPU profiling" in result.message
+        assert "Read-only file system" in result.message
+        assert not self.handler.profile_in_progress
+        assert self.handler.torch_profiler is None
+        assert self.api.sessions == []
 
 
 if __name__ == "__main__":

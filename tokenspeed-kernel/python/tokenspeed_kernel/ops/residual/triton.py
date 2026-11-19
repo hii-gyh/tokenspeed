@@ -1699,6 +1699,286 @@ def mhc_post_comb_hc4(
 
 
 @triton.jit
+def _engram_gate_hc4_kernel(
+    hidden,
+    original,
+    key,
+    value,
+    query_weight,
+    key_weight,
+    token_mask,
+    out,
+    dim: tl.constexpr,
+    eps: tl.constexpr,
+    scale: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    stream = tl.program_id(1)
+    base = (token_id.to(tl.int64) * 4 + stream) * dim
+    weight_base = stream * dim
+    value_base = token_id.to(tl.int64) * dim
+    hidden_sq = tl.zeros((), tl.float32)
+    key_sq = tl.zeros((), tl.float32)
+    dot = tl.zeros((), tl.float32)
+    for start in range(0, dim, BLOCK):
+        cols = start + tl.arange(0, BLOCK)
+        mask = cols < dim
+        source = tl.load(original + base + cols, mask=mask, other=0.0)
+        keys = tl.load(key + base + cols, mask=mask, other=0.0)
+        weight = tl.load(query_weight + weight_base + cols, mask=mask, other=0.0)
+        weight = weight * tl.load(key_weight + weight_base + cols, mask=mask, other=0.0)
+        hidden_sq += tl.sum(source * source)
+        key_sq += tl.sum(keys * keys)
+        dot += tl.sum(source * weight * keys)
+    rstd = tl.rsqrt(hidden_sq / dim + eps) * tl.rsqrt(key_sq / dim + eps)
+    dot = dot * rstd * scale
+    # NPU has no copysign kernel; a negative dot carries the sign.
+    magnitude = tl.sqrt(tl.maximum(tl.abs(dot), 1e-6))
+    gate = tl.sigmoid(tl.where(dot < 0, -magnitude, magnitude))
+    gate = tl.where(tl.load(token_mask + token_id) != 0, gate, 0.0)
+    for start in range(0, dim, BLOCK):
+        cols = start + tl.arange(0, BLOCK)
+        mask = cols < dim
+        streams = tl.load(hidden + base + cols, mask=mask, other=0.0)
+        shared = tl.load(value + value_base + cols, mask=mask, other=0.0)
+        tl.store(
+            out + base + cols,
+            (streams + gate * shared).to(out.dtype.element_ty),
+            mask=mask,
+        )
+
+
+def engram_gate_hc4(
+    hidden: torch.Tensor,
+    original: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_weight: torch.Tensor,
+    key_weight: torch.Tensor,
+    token_mask: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Add a shared value to four residual streams through a normalized dot gate.
+
+    Both RMS normalizations, the dot product, the signed square-root gate and
+    the residual add run in one launch; the torch form issues roughly fifteen
+    kernels over the same bytes.
+
+    Args:
+        hidden: Contiguous FP32 residual streams ``[T,4,D]`` that receive the add.
+        original: Contiguous FP32 streams ``[T,4,D]`` the gate normalizes; equal
+            to ``hidden`` unless a rotation was undone first.
+        key: Contiguous FP32 per-stream keys ``[T,4,D]``.
+        value: Contiguous FP32 shared value ``[T,D]``.
+        query_weight: Contiguous FP32 query normalization weights ``[4,D]``.
+        key_weight: Contiguous FP32 key normalization weights ``[4,D]``.
+        token_mask: Boolean ``[T]`` participation mask; false rows pass through.
+        eps: Positive epsilon for both RMS normalizations.
+
+    Returns:
+        BF16 residual streams ``[T,4,D]``.
+    """
+    tokens, _, dim = hidden.shape
+    out = torch.empty(hidden.shape, dtype=torch.bfloat16, device=hidden.device)
+    _engram_gate_hc4_kernel[(tokens, 4)](
+        hidden,
+        original,
+        key,
+        value,
+        query_weight,
+        key_weight,
+        token_mask,
+        out,
+        dim=dim,
+        eps=eps,
+        scale=dim**-0.5,
+        BLOCK=1024,
+        num_warps=4,
+    )
+    return out
+
+
+@triton.jit
+def _mhc_collapse_pre_hc4_kernel(
+    residual,
+    pre,
+    out,
+    hidden_size,
+    BLOCK: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+    cols = block_id * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < hidden_size
+    streams = tl.arange(0, 4)
+    res_base = token_id.to(tl.int64) * 4 * hidden_size
+    values = tl.load(
+        residual + res_base + streams[:, None] * hidden_size + cols[None, :],
+        mask=mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    coeff = tl.load(pre + token_id.to(tl.int64) * 4 + streams)
+    total = tl.sum(values * coeff[:, None], axis=0)
+    tl.store(
+        out + token_id.to(tl.int64) * hidden_size + cols,
+        total.to(out.dtype.element_ty),
+        mask=mask,
+    )
+
+
+def mhc_collapse_pre_hc4(residual: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
+    """Collapse four residual streams into a layer input, in one launch.
+
+    The torch form casts the streams to FP32, scales them, reduces over the
+    stream axis and casts back — four kernels over the same bytes. This reads
+    the BF16 streams once and keeps the accumulation in FP32 registers.
+
+    Args:
+        residual: Contiguous BF16 residual streams ``[T,4,H]``.
+        pre: Contiguous FP32 coefficients ``[T,4]``.
+
+    Returns:
+        BF16 layer input ``[T,H]``.
+    """
+    tokens, _, hidden = residual.shape
+    out = torch.empty((tokens, hidden), dtype=residual.dtype, device=residual.device)
+    block = 1024
+    _mhc_collapse_pre_hc4_kernel[(tokens, triton.cdiv(hidden, block))](
+        residual,
+        pre,
+        out,
+        hidden,
+        BLOCK=block,
+        num_warps=4,
+    )
+    return out
+
+
+@triton.jit
+def _mhc_combine_post_hc4_kernel(
+    x,
+    residual,
+    post,
+    comb,
+    out,
+    hidden_size,
+    BLOCK: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+    cols = block_id * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < hidden_size
+    streams = tl.arange(0, 4)
+    token_base = token_id.to(tl.int64) * 4 * hidden_size
+    values = tl.load(
+        residual + token_base + streams[:, None] * hidden_size + cols[None, :],
+        mask=mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    sublayer = tl.load(
+        x + token_id.to(tl.int64) * hidden_size + cols, mask=mask, other=0.0
+    ).to(tl.float32)
+    for out_stream in tl.static_range(4):
+        # comb's last two axes are input and output stream; sum over the input.
+        coeff = tl.load(comb + token_id.to(tl.int64) * 16 + streams * 4 + out_stream)
+        mixed = tl.sum(values * coeff[:, None], axis=0)
+        scale = tl.load(post + token_id.to(tl.int64) * 4 + out_stream)
+        result = mixed + scale * sublayer
+        tl.store(
+            out + token_base + out_stream * hidden_size + cols,
+            result.to(out.dtype.element_ty),
+            mask=mask,
+        )
+
+
+def mhc_combine_post_hc4(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    """Mix a sublayer output back into four residual streams, in one launch.
+
+    Args:
+        x: Contiguous BF16 sublayer output ``[T,H]``.
+        residual: Contiguous BF16 residual streams ``[T,4,H]``.
+        post: Contiguous FP32 post coefficients ``[T,4]``.
+        comb: Contiguous FP32 combine coefficients ``[T,4,4]``, last two axes
+            input and output stream.
+
+    Returns:
+        BF16 residual streams ``[T,4,H]``.
+    """
+    tokens, _, hidden = residual.shape
+    out = torch.empty_like(residual)
+    block = 1024
+    _mhc_combine_post_hc4_kernel[(tokens, triton.cdiv(hidden, block))](
+        x,
+        residual,
+        post,
+        comb,
+        out,
+        hidden,
+        BLOCK=block,
+        num_warps=4,
+    )
+    return out
+
+
+@triton.jit
+def _mhc_sinkhorn_hc4_kernel(
+    comb_mix,
+    hc_eps: tl.constexpr,
+    sinkhorn_iters: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    offsets = tl.arange(0, 16)
+    base = token_id.to(tl.int64) * 16
+    comb_matrix = tl.reshape(tl.load(comb_mix + base + offsets), (4, 4))
+    col_sum = tl.sum(comb_matrix, axis=0)
+    comb_matrix = comb_matrix / (tl.expand_dims(col_sum, 0) + hc_eps)
+    for _ in tl.static_range(1, sinkhorn_iters):
+        row_sum = tl.sum(comb_matrix, axis=1)
+        comb_matrix = comb_matrix / (tl.expand_dims(row_sum, 1) + hc_eps)
+        col_sum = tl.sum(comb_matrix, axis=0)
+        comb_matrix = comb_matrix / (tl.expand_dims(col_sum, 0) + hc_eps)
+    tl.store(comb_mix + base + offsets, tl.reshape(comb_matrix, (16,)))
+
+
+def mhc_sinkhorn_hc4(
+    comb: torch.Tensor,
+    *,
+    hc_eps: float,
+    sinkhorn_iters: int,
+) -> None:
+    """Sinkhorn-normalize an hc=4 combine matrix in place, in one launch.
+
+    The torch form of this loop issues a reduction, an add and a divide per
+    half-iteration. On a ``[T,4,4]`` matrix those are all fixed launch cost:
+    at 20 iterations, two sublayers and 40 layers that is thousands of micro
+    kernels per decode step. One program owns a whole 4x4 tile, so the
+    iterations stay in registers.
+
+    Args:
+        comb: Contiguous FP32 combine coefficients ``[T,4,4]``, already
+            softmaxed over the last axis and offset by ``hc_eps``. Normalized
+            in place; the last two axes are input and output residual streams.
+        hc_eps: Epsilon added to each row and column sum.
+        sinkhorn_iters: Positive number of column/row normalization rounds.
+
+    Returns:
+        None. ``comb`` is rewritten in place.
+    """
+    _mhc_sinkhorn_hc4_kernel[(comb.shape[0],)](
+        comb,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        num_warps=1,
+    )
+
+
+@triton.jit
 def _mhc_pre_layer_norm_hc4_kernel(
     pre_mix,
     residual,

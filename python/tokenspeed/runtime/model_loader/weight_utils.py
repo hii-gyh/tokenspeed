@@ -184,6 +184,21 @@ def get_quant_config(
                 with open(hf_quant_path, encoding="utf-8") as f:
                     hf_quant = json.load(f).get("quantization", {})
                 hf_quant_config = with_hf_quant_layers(hf_quant_config, hf_quant)
+        # Ascend modelslim packs put only a stub in config.json
+        # (quant_method/model_quant_type). Per-tensor FLOAT/W8A8 labels live in
+        # quant_model_description.json; prefer that file when present.
+        ascend = (
+            model_config.quantization == "ascend"
+            or hf_quant_config.get("quant_method") == "ascend"
+        )
+        if ascend:
+            description = os.path.join(
+                _json_folder(model_config, load_config),
+                "quant_model_description.json",
+            )
+            if os.path.isfile(description):
+                with open(description, encoding="utf-8") as f:
+                    return quant_cls.from_config(json.load(f))
         return quant_cls.from_config(hf_quant_config)
     hf_folder = _json_folder(model_config, load_config)
 

@@ -24,7 +24,7 @@ import math
 
 import torch as _torch
 from tokenspeed_kernel.ops.quantization import quantize_fp8
-from tokenspeed_kernel.platform import Platform
+from tokenspeed_kernel.platform import Platform, current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -1239,15 +1239,19 @@ __all__ = [
     "attn_res_fwd",
     "attn_res_fwd_available",
     "boundary_gathers_mailbox",
+    "engram_gate",
     "gated_residual_combine",
     "gated_residual_mix",
     "mhc_apply_pre",
     "mhc_apply_pre_quantize_fp8",
+    "mhc_collapse_pre",
+    "mhc_combine_post",
     "mhc_fused_hc",
     "mhc_init",
     "mhc_mixes",
     "mhc_post",
     "mhc_pre",
+    "mhc_sinkhorn",
     "pad_gated_residual_projection_weight",
     "post_norm_residual_pre_norm",
     "post_norm_residual_pre_norm_bf16",
@@ -1255,6 +1259,152 @@ __all__ = [
     "try_mhc_shifted_post_pre_norm",
     "try_mhc_shifted_post_pre_norm_quantize_fp8",
 ]
+
+
+def engram_gate(
+    hidden: _torch.Tensor,
+    original: _torch.Tensor,
+    key: _torch.Tensor,
+    value: _torch.Tensor,
+    query_weight: _torch.Tensor,
+    key_weight: _torch.Tensor,
+    token_mask: _torch.Tensor,
+    eps: float,
+) -> _torch.Tensor:
+    """Add a shared value to residual streams through a normalized dot gate.
+
+    Args:
+        hidden: FP32 residual streams [T,4,D] that receive the add.
+        original: FP32 streams [T,4,D] the gate normalizes; equal to ``hidden``
+            unless a rotation was undone first.
+        key: FP32 per-stream keys [T,4,D].
+        value: FP32 shared value [T,D].
+        query_weight: FP32 query normalization weights [4,D].
+        key_weight: FP32 key normalization weights [4,D].
+        token_mask: Boolean [T] participation mask; false rows pass through.
+        eps: Positive epsilon for both RMS normalizations.
+
+    Returns:
+        BF16 residual streams [T,4,D].
+    """
+    if hidden.ndim != 3 or hidden.shape[1] != 4 or eps <= 0:
+        raise ValueError("engram_gate requires streams [T,4,D] and a positive epsilon")
+    if current_platform().is_npu:
+        from tokenspeed_kernel.ops.residual.triton import engram_gate_hc4
+
+        return engram_gate_hc4(
+            hidden.contiguous(),
+            original.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            query_weight.contiguous(),
+            key_weight.contiguous(),
+            token_mask.contiguous(),
+            eps,
+        )
+    weight = query_weight * key_weight
+    rstd = _torch.rsqrt(original.square().mean(-1) + eps) * _torch.rsqrt(
+        key.square().mean(-1) + eps
+    )
+    dim = hidden.shape[-1]
+    dot = (original * weight * key).sum(-1) * rstd * dim**-0.5
+    magnitude = dot.abs().clamp_min(1e-6).sqrt()
+    gate = _torch.sigmoid(_torch.where(dot < 0, -magnitude, magnitude))
+    gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
+    return hidden + gate.unsqueeze(-1) * value.unsqueeze(-2)
+
+
+def mhc_collapse_pre(residual: _torch.Tensor, pre: _torch.Tensor) -> _torch.Tensor:
+    """Collapse residual streams with pre coefficients into a layer input.
+
+    Args:
+        residual: Contiguous BF16 residual streams [T,4,H].
+        pre: Contiguous FP32 pre coefficients [T,4].
+
+    Returns:
+        BF16 layer input [T,H].
+    """
+    if residual.ndim != 3 or residual.shape[1] != 4:
+        raise ValueError("mhc_collapse_pre requires residual [T,4,H]")
+    if pre.shape != residual.shape[:2] or pre.dtype != _torch.float32:
+        raise ValueError("mhc_collapse_pre requires FP32 pre coefficients [T,4]")
+    if current_platform().is_npu:
+        from tokenspeed_kernel.ops.residual.triton import mhc_collapse_pre_hc4
+
+        return mhc_collapse_pre_hc4(residual.contiguous(), pre.contiguous())
+    return (pre.unsqueeze(-1) * residual.float()).sum(-2).to(residual.dtype)
+
+
+def mhc_combine_post(
+    x: _torch.Tensor,
+    residual: _torch.Tensor,
+    post: _torch.Tensor,
+    comb: _torch.Tensor,
+) -> _torch.Tensor:
+    """Mix a sublayer output back into the residual streams.
+
+    Args:
+        x: Contiguous BF16 sublayer output [T,H].
+        residual: Contiguous BF16 residual streams [T,4,H].
+        post: Contiguous FP32 post coefficients [T,4].
+        comb: Contiguous FP32 combine coefficients [T,4,4], last two axes
+            input and output stream.
+
+    Returns:
+        BF16 residual streams [T,4,H].
+    """
+    if residual.ndim != 3 or residual.shape[1] != 4:
+        raise ValueError("mhc_combine_post requires residual [T,4,H]")
+    if x.shape != (residual.shape[0], residual.shape[2]):
+        raise ValueError("mhc_combine_post requires a sublayer output [T,H]")
+    if post.shape != residual.shape[:2] or comb.shape != (residual.shape[0], 4, 4):
+        raise ValueError("mhc_combine_post requires post [T,4] and comb [T,4,4]")
+    if current_platform().is_npu:
+        from tokenspeed_kernel.ops.residual.triton import mhc_combine_post_hc4
+
+        # CANN's npu_mhc_post wants an FP32 residual stream; this model keeps
+        # it in BF16, and the cast would cost more than the fusion saves.
+        return mhc_combine_post_hc4(
+            x.contiguous(), residual.contiguous(), post.contiguous(), comb.contiguous()
+        )
+    mixed = (comb.unsqueeze(-1) * residual.float().unsqueeze(-2)).sum(-3)
+    return (post.unsqueeze(-1) * x.float().unsqueeze(-2) + mixed).to(x.dtype)
+
+
+def mhc_sinkhorn(
+    comb: _torch.Tensor,
+    hc_eps: float,
+    sinkhorn_iters: int,
+) -> _torch.Tensor:
+    """Balance an mHC combine matrix's input and output stream sums.
+
+    Args:
+        comb: Contiguous FP32 combine coefficients [T,4,4], already softmaxed
+            over the last axis and offset by ``hc_eps``. The last two axes are
+            input and output residual streams.
+        hc_eps: Epsilon added to each row and column sum.
+        sinkhorn_iters: Positive number of column/row normalization rounds.
+
+    Returns:
+        The balanced coefficients. Ascend normalizes ``comb`` in place and
+        returns it; the portable path returns a new tensor.
+    """
+    if comb.ndim != 3 or comb.shape[1:] != (4, 4):
+        raise ValueError("mhc_sinkhorn requires combine coefficients [T,4,4]")
+    if comb.dtype != _torch.float32 or not comb.is_contiguous():
+        raise ValueError("mhc_sinkhorn requires contiguous FP32 coefficients")
+    if sinkhorn_iters < 1 or hc_eps <= 0:
+        raise ValueError("mhc_sinkhorn requires positive iterations and epsilon")
+    if current_platform().is_npu:
+        from tokenspeed_kernel.ops.residual.triton import mhc_sinkhorn_hc4
+
+        mhc_sinkhorn_hc4(comb, hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters)
+        return comb
+    comb = comb / (comb.sum(-2, keepdim=True) + hc_eps)
+    for _ in range(sinkhorn_iters - 1):
+        comb = comb / (comb.sum(-1, keepdim=True) + hc_eps)
+        comb = comb / (comb.sum(-2, keepdim=True) + hc_eps)
+    return comb
 
 
 def normalized_dot_gate(residual, key_value, query_weight, key_weight, mask, eps):

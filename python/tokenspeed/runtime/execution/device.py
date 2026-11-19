@@ -417,6 +417,11 @@ class DeviceHandle:
         self._kv_transfer = kv_transfer
         self._role = _resolve_role(kv_transfer)
 
+    @property
+    def device_type(self) -> str:
+        """Accelerator type used by host-side profiling backend selection."""
+        return self._forward_device.type
+
     def bind_forward_thread(self) -> None:
         """Make the calling thread the forward thread: give it the rank's
         device. Called once, by that thread, before any other operation."""

@@ -393,6 +393,8 @@ class Envs:
 
     # Multimodal / VLM
     TOKENSPEED_LOG_MM_TIMING = EnvBool(False)
+    # Sampled eager layer attribution using events and non-blocking completion polls.
+    TOKENSPEED_LOG_LAYER_KIND_TIMING = EnvBool(False)
     TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH = EnvBool(False)
     TOKENSPEED_MM_VIDEO_ENCODER_CUDA_GRAPH_MAX_SEQUENCES_PER_BATCH = EnvInt(None)
     # Eager V4.1 vision input tokens, before spatial merging.

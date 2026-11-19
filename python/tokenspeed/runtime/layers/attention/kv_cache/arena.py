@@ -46,6 +46,11 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 
 logger = get_colorful_logger(__name__)
 
+# Ascend Direct requires 2 MiB-aligned device addresses for HCCS memory
+# registration. Keep one aligned allocation path for every device cache so PD
+# does not acquire a platform-specific arena layout.
+_DEVICE_REGION_ALIGNMENT = 2 * 1024 * 1024
+
 
 def _copy_waves(
     pairs_by_group: Mapping[str, np.ndarray],
@@ -194,12 +199,22 @@ class CacheArena:
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
             for region in self.storage_plan.regions:
                 host = region.placement == "host"
-                self.regions[region.region_id] = torch.zeros(
-                    region.size_bytes,
-                    dtype=torch.uint8,
-                    device="cpu" if host else device,
-                    pin_memory=host,
-                )
+                if host:
+                    buffer = torch.zeros(
+                        region.size_bytes,
+                        dtype=torch.uint8,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                else:
+                    storage = torch.zeros(
+                        region.size_bytes + _DEVICE_REGION_ALIGNMENT - 1,
+                        dtype=torch.uint8,
+                        device=device,
+                    )
+                    offset = (-storage.data_ptr()) % _DEVICE_REGION_ALIGNMENT
+                    buffer = storage.narrow(0, offset, region.size_bytes)
+                self.regions[region.region_id] = buffer
         self._field_bindings = {b.field_id: b for b in self.storage_plan.fields}
         self._fields: dict[str, torch.Tensor] = {
             field.field_id: self._bind(field) for field in plan.fields
@@ -311,13 +326,16 @@ class CacheArena:
         binding = self._field_bindings[field.field_id]
         buffer = self.regions[binding.region_id]
         offset = binding.offset_bytes
-        pages = buffer.view(dtype).as_strided(
+        typed = buffer.view(dtype)
+        # as_strided takes an absolute storage offset, not one relative to the
+        # aligned region view; otherwise fields precede the arena's data_ptr.
+        pages = typed.as_strided(
             (group.page_count, *field.shape),
             (
                 field.page_stride_bytes // field.element_size,
                 *reversed(element_strides),
             ),
-            offset // field.element_size,
+            typed.storage_offset() + offset // field.element_size,
         )
         spec = self._cache_group_specs_by_id[field.group_id]
         # Keep ordinary fields' addressing contract. History groups can also

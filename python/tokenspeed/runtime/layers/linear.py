@@ -63,6 +63,7 @@ from tokenspeed.runtime.layers.parameter import (
     RowParallelWeightParameter,
 )
 from tokenspeed.runtime.layers.quantization import (
+    AscendQuantConfig,
     Fp8Config,
     Fp8WeightOnlyConfig,
     ModelOptMixedConfig,
@@ -215,6 +216,10 @@ class LinearBase(torch.nn.Module):
         elif isinstance(quant_config, ModelOptMixedConfig):
             self.quant_method = quant_config.get_quant_method(self, prefix)
         elif isinstance(quant_config, Fp8WeightOnlyConfig):
+            self.quant_method = quant_config.get_quant_method(self, prefix)
+        elif isinstance(quant_config, AscendQuantConfig):
+            # Ascend modelslim W8A8: get_quant_method picks AscendW8A8 or
+            # unquantized FLOAT rows from the checkpoint's per-layer kinds.
             self.quant_method = quant_config.get_quant_method(self, prefix)
         else:
             if isinstance(quant_config, Fp8Config):

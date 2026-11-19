@@ -331,6 +331,94 @@ def _prepare_ngram_hash(
                     tl.store(prefix + rows * 3 + col, value, empty)
 
 
+# Device-side Engram hash constants are immutable for the life of the
+# process. Copying the vocab-sized token_map to the host on every NPU
+# prepare dominated decode input_fill (~3s/step); cache the CPU view once.
+_HOST_HASH_PARAMS: dict[int, NGramHashParams] = {}
+
+
+def _host_hash_params(params: NGramHashParams) -> NGramHashParams:
+    if params.token_map.device.type == "cpu":
+        return params
+    key = id(params.token_map)
+    cached = _HOST_HASH_PARAMS.get(key)
+    if cached is not None:
+        return cached
+
+    def host(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.detach().to(device="cpu")
+
+    cached = NGramHashParams(
+        host(params.token_map),
+        host(params.primes),
+        host(params.reciprocals),
+        host(params.offsets),
+        host(params.multipliers),
+        params.pad_id,
+    )
+    _HOST_HASH_PARAMS[key] = cached
+    return cached
+
+
+def _prepare_ngram_inputs_on_host(
+    snapshots: torch.Tensor,
+    positions: torch.Tensor,
+    reset: torch.Tensor,
+    slots: torch.Tensor,
+    cache_lengths: torch.Tensor,
+    request_ends: torch.Tensor,
+    tail: torch.Tensor,
+    needs_seed: torch.Tensor,
+    ids: torch.Tensor,
+    previous: torch.Tensor,
+    token_mask: torch.Tensor,
+    prefix: torch.Tensor,
+    hashes: torch.Tensor,
+    total: int,
+    vocab_size: int,
+    uniform_length: int,
+    hash_params: NGramHashParams,
+) -> None:
+    """Run the reference n-gram hash on the CPU and copy the int64 ids back.
+
+    Isolated int64 remainder and copy succeed on NPU. The full forward still
+    reports ACL 507034 at the first later sync, so this reference stays off
+    the model stream. The host result is copied onto the caller's buffers.
+    """
+
+    def host(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.detach().to(device="cpu")
+
+    params = _host_hash_params(hash_params)
+    previous_h = host(previous)
+    mask_h = host(token_mask)
+    prefix_h = host(prefix)
+    hashes_h = host(hashes)
+    prepare_ngram_inputs(
+        host(snapshots),
+        host(positions),
+        host(reset),
+        host(slots),
+        host(cache_lengths),
+        host(request_ends),
+        host(tail),
+        host(needs_seed),
+        host(ids),
+        previous_h,
+        mask_h,
+        prefix_h,
+        hashes_h,
+        total,
+        vocab_size,
+        uniform_length,
+        params,
+    )
+    previous.copy_(previous_h)
+    token_mask.copy_(mask_h)
+    prefix.copy_(prefix_h)
+    hashes.copy_(hashes_h)
+
+
 def prepare_ngram_inputs(
     snapshots: torch.Tensor,
     positions: torch.Tensor,
@@ -365,6 +453,27 @@ def prepare_ngram_inputs(
     """
     bs = slots.numel()
     if not ids.is_cuda:
+        if ids.device.type != "cpu":
+            _prepare_ngram_inputs_on_host(
+                snapshots,
+                positions,
+                reset,
+                slots,
+                cache_lengths,
+                request_ends,
+                tail,
+                needs_seed,
+                ids,
+                previous,
+                token_mask,
+                prefix,
+                hashes,
+                total,
+                vocab_size,
+                uniform_length,
+                hash_params,
+            )
+            return
         seed = reset.bool() | needs_seed[slots]
         delta = cache_lengths[slots] - positions
         torch._assert_async(
@@ -506,6 +615,83 @@ def _commit_ngram(
     tl.store(cache_lengths + slot, frontier + delta, live)
 
 
+def _commit_ngram_inputs_reference(
+    slots: torch.Tensor,
+    lengths: torch.Tensor,
+    accepted: torch.Tensor,
+    ids: torch.Tensor,
+    previous: torch.Tensor,
+    token_mask: torch.Tensor,
+    prefix: torch.Tensor,
+    tail: torch.Tensor,
+    needs_seed: torch.Tensor,
+    cache_lengths: torch.Tensor,
+    num_extends: int,
+    padding_slot: int,
+) -> None:
+    """Reference commit; all tensors must share one device (typically CPU)."""
+    bs = slots.numel()
+    rows = torch.arange(bs, device=slots.device)
+    delta = torch.where(rows < num_extends, lengths, accepted)
+    live = slots != padding_slot
+    delta = torch.where(live, delta, 0)
+    advancing = live & (delta > 0)
+    last = (lengths.cumsum(0) - lengths + delta - 1)[advancing]
+    current = torch.where(token_mask[last], ids[last], -1)
+    value = prefix.clone()
+    value[advancing] = torch.cat((current[:, None], previous[last, :2]), dim=1)
+    tail[slots[live]] = value[live]
+    needs_seed[slots[live]] = False
+    cache_lengths[slots[live]] += delta[live]
+
+
+def _commit_ngram_inputs_on_host(
+    slots: torch.Tensor,
+    lengths: torch.Tensor,
+    accepted: torch.Tensor,
+    ids: torch.Tensor,
+    previous: torch.Tensor,
+    token_mask: torch.Tensor,
+    prefix: torch.Tensor,
+    tail: torch.Tensor,
+    needs_seed: torch.Tensor,
+    cache_lengths: torch.Tensor,
+    num_extends: int,
+    padding_slot: int,
+) -> None:
+    """Run the reference commit on CPU and copy mutable outputs back.
+
+    NPU cannot use the CUDA Triton commit, and launching the reference as a
+    chain of tiny device-side torch ops on NPU dominates decode wall time
+    (same class of trap as prepare_ngram's ACL path). Mirror prepare: compute
+    on the host, then write ``tail`` / ``needs_seed`` / ``cache_lengths``.
+    """
+
+    def host(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.detach().to(device="cpu")
+
+    tail_h = host(tail)
+    needs_h = host(needs_seed)
+    cache_h = host(cache_lengths)
+    _commit_ngram_inputs_reference(
+        host(slots),
+        host(lengths),
+        host(accepted),
+        host(ids),
+        host(previous),
+        host(token_mask),
+        host(prefix),
+        tail_h,
+        needs_h,
+        cache_h,
+        num_extends,
+        padding_slot,
+    )
+    tail.copy_(tail_h)
+    needs_seed.copy_(needs_h)
+    cache_lengths.copy_(cache_h)
+
+
 def commit_ngram_inputs(
     slots: torch.Tensor,
     lengths: torch.Tensor,
@@ -528,23 +714,30 @@ def commit_ngram_inputs(
     must remain alive through commit, including after embedding IDs are clamped.
     """
     bs = slots.numel()
-    if not ids.is_cuda:
-        rows = torch.arange(bs, device=slots.device)
-        delta = torch.where(rows < num_extends, lengths, accepted)
-        live = slots != padding_slot
-        delta = torch.where(live, delta, 0)
-        advancing = live & (delta > 0)
-        last = (lengths.cumsum(0) - lengths + delta - 1)[advancing]
-        current = torch.where(token_mask[last], ids[last], -1)
-        value = prefix.clone()
-        value[advancing] = torch.cat((current[:, None], previous[last, :2]), dim=1)
-        tail[slots[live]] = value[live]
-        needs_seed[slots[live]] = False
-        cache_lengths[slots[live]] += delta[live]
+    if ids.is_cuda:
+        if bs:
+            rows = _COMMIT_ROWS
+            _commit_ngram[(triton.cdiv(bs, rows),)](
+                slots,
+                lengths,
+                accepted,
+                ids,
+                previous,
+                token_mask,
+                prefix,
+                tail,
+                needs_seed,
+                cache_lengths,
+                bs,
+                num_extends,
+                padding_slot,
+                previous.shape[0],
+                rows,
+                num_warps=4,
+            )
         return
-    if bs:
-        rows = _COMMIT_ROWS
-        _commit_ngram[(triton.cdiv(bs, rows),)](
+    if ids.device.type != "cpu":
+        _commit_ngram_inputs_on_host(
             slots,
             lengths,
             accepted,
@@ -555,13 +748,24 @@ def commit_ngram_inputs(
             tail,
             needs_seed,
             cache_lengths,
-            bs,
             num_extends,
             padding_slot,
-            previous.shape[0],
-            rows,
-            num_warps=4,
         )
+        return
+    _commit_ngram_inputs_reference(
+        slots,
+        lengths,
+        accepted,
+        ids,
+        previous,
+        token_mask,
+        prefix,
+        tail,
+        needs_seed,
+        cache_lengths,
+        num_extends,
+        padding_slot,
+    )
 
 
 register_triton_warmup(_prepare_ngram_hash, variants=({"ROWS": (4, 8, 16)},))

@@ -46,3 +46,34 @@ scores may select different valid boundary ties from an FP32-score Top-K.
 Correctness checks therefore compare selected score multisets against the
 same BF16 input, while model-quality checks must assess the precision change
 separately. The Hopper score producer retains FP32 output.
+
+## Ascend FlatKV torch codec
+
+The torch scatter packs value and scale columns into one selected-byte transfer.
+Duplicate destinations retain the last active row; inactive rows retain their
+read-back payload. Batches of at most 64 rows resolve that winner with pairwise
+key comparisons instead of integer `argsort`, which otherwise runs on AiCpu.
+Larger batches keep the sort-based implementation to bound comparison scratch.
+
+On Ascend, selected-byte reads use `index_select`: advanced-index reads from a
+multi-GiB strided cache can fail during NPU Graph replay. Writes use the native
+ND scatter in `_ascend_codec.py`; advanced-index and `index_copy_` writes were
+observed not to update the external cache on replay. CANN 9.2.1 silently
+corrupted ND updates larger than 4096 bytes, so the helper splits larger
+payloads into bounded launches. Decode-sized writes remain a single launch.
+Inactive writes use slot zero as a read-modify-write destination and share that
+destination's winner key, so they cannot overwrite a valid slot-zero update.
+The hardware probe covers SWA, global and index layouts with duplicate and
+inactive slots on the real 4.38 GB strided arena. The regression
+`test/npu/ops/test_dsv41_ascend_codec.py` checks payloads beyond 4096 bytes in
+both eager and graph replay; the generic CPU behavior tests retain the
+portable path.
+The BF16 direct-attention mirror uses a distinct three-dimensional ND update:
+indices select `[page,row]` and each update is one 512-channel BF16 row. Unlike
+the flat uint8 byte path, this operator matched advanced-index writes through
+2048 rows on CANN 9.2.1 and does not use the 4096-byte splitting workaround.
+The same read-back and winner logic preserves inactive and duplicate slots;
+strided-arena Graph tests cover 55/512/2048 rows and updated-input replay.
+Runtime quantization extracts float bit fields with floor-divide and multiply
+rather than integer shifts, whose NPU Graph replay produced different exponents
+and packed bytes from eager.

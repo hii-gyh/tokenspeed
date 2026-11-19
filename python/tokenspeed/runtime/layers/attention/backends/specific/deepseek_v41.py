@@ -43,6 +43,8 @@ holds (``V41Metadata.global_write_floor``).
 """
 
 import logging
+import os
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -52,7 +54,10 @@ from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import normalize_dcp_parti
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.distributed.comm_ops import all_gather, token_all_gather
+from tokenspeed.runtime.execution.breakable_cuda_graph import current_forward_ctx
+from tokenspeed.runtime.execution.debug_tensor_capture import capture_debug_tensor
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.layer_kind_timing import layer_kind_scope
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
@@ -98,6 +103,50 @@ from tokenspeed.runtime.utils.host_sync import allow_host_sync
 # Initial long-prefill thresholds; tune with query count and visible history.
 _INDEXER_PARTITION_MIN_QUERIES = 4096
 _INDEXER_PARTITION_MIN_HISTORY = 8192
+
+# Debug-only Ascend decode stage timing (synced). Off unless explicitly set.
+_LOG_V41_ATTN = os.environ.get("TOKENSPEED_LOG_V41_ATTN", "").strip() not in (
+    "",
+    "0",
+    "false",
+    "False",
+)
+_logger = logging.getLogger(__name__)
+_v41_attn_log_count = 0
+
+# Ascend writes BF16 rows straight into the mirror and skips the packed write.
+# Decode reads only the mirror on NPU, so results stay correct while the
+# quantize-and-mirror round trip leaves the step: the packed write otherwise
+# costs one byte-level scatter per field per layer, about 25 ms per decode step
+# at bs8. Set the variable to 0 to restore the packed write for comparison.
+_BF16_ONLY_WRITE = os.environ.get("TOKENSPEED_V41_BF16_ONLY_WRITE", "1").strip() in (
+    "1",
+    "true",
+    "True",
+)
+
+
+def _v41_attn_timing(device: torch.device) -> bool:
+    """Synced stage timers: on only outside graph capture (CUDA/NPU)."""
+    if not _LOG_V41_ATTN:
+        return False
+    from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
+
+    # Capture forbids stream synchronize; skip timing entirely until replay.
+    return not is_current_stream_capturing(device)
+
+
+def _sync_ms(device: torch.device, t0: float) -> float:
+    # Never synchronize a captured stream (Ascend EE1016 / CUDA capture rules).
+    from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
+
+    if is_current_stream_capturing(device):
+        return 0.0
+    if device.type == "cuda":
+        torch.cuda.current_stream().synchronize()
+    elif device.type == "npu":
+        torch.npu.current_stream().synchronize()
+    return (time.perf_counter() - t0) * 1000.0
 
 
 class V41CompressorPlan(NamedTuple):
@@ -233,6 +282,10 @@ class V41Selection:
     lengths: torch.Tensor
     candidates: V41Candidates | None
     physical_slots: torch.Tensor
+    # Ascend decode memos for this forward only. Reuse layers share this record;
+    # a later forward builds a fresh selection and refreshed logical rows.
+    ascend_global_rows: torch.Tensor | None = None
+    ascend_global_indices: torch.Tensor | None = None
 
 
 @dataclass
@@ -1273,7 +1326,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         # Read before any writes: a scheduler-reused tail page must not destroy
         # the odd-prefix input needed by the first completed pair in this chunk.
         tail = self.cache_pool.compressor_tail(owner)
-        if content.is_cuda:
+        on_accelerator = content.is_cuda or content.device.type == "npu"
+        if on_accelerator:
             from tokenspeed_kernel.ops.attention import dsv41
 
             pooled = dsv41.compressor_pool(
@@ -1287,38 +1341,34 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 norm_weight,
                 norm_eps,
             )
-        else:
-            missing = active & (previous < 0)
-            pooled = torch.empty_like(content)
-            for start in range(0, positions.numel(), 8):
-                stop = min(start + 8, positions.numel())
-                slot = slots[start:stop].clamp_min(0)
-                history = tail[slot // 2, slot % 2]
-                prior = previous[start:stop].clamp_min(0)
-                prior_content = torch.where(
-                    missing[start:stop, None], history[:, 0], content[prior]
-                )
-                prior_scores = torch.where(
-                    missing[start:stop, None], history[:, 1], scores[prior]
-                )
-                weights = torch.stack(
-                    (prior_scores, scores[start:stop]), dim=1
-                ).softmax(1)
-                pooled[start:stop] = (
-                    weights[:, 0] * prior_content + weights[:, 1] * content[start:stop]
-                ).masked_fill(~active[start:stop, None], 0)
-        if not content.is_cuda and norm_weight is not None:
+            dsv41.compressor_tail_scatter(content, scores, tail, write_slots)
+            return pooled, pair_positions, pair_requests
+        missing = active & (previous < 0)
+        pooled = torch.empty_like(content)
+        for start in range(0, positions.numel(), 8):
+            stop = min(start + 8, positions.numel())
+            slot = slots[start:stop].clamp_min(0)
+            history = tail[slot // 2, slot % 2]
+            prior = previous[start:stop].clamp_min(0)
+            prior_content = torch.where(
+                missing[start:stop, None], history[:, 0], content[prior]
+            )
+            prior_scores = torch.where(
+                missing[start:stop, None], history[:, 1], scores[prior]
+            )
+            weights = torch.stack((prior_scores, scores[start:stop]), dim=1).softmax(1)
+            pooled[start:stop] = (
+                weights[:, 0] * prior_content + weights[:, 1] * content[start:stop]
+            ).masked_fill(~active[start:stop, None], 0)
+        if norm_weight is not None:
             normalized = pooled.to(torch.bfloat16).float()
             normalized = normalized * torch.rsqrt(
                 normalized.square().mean(-1, keepdim=True) + norm_eps
             )
             pooled = (normalized * norm_weight.float()).to(torch.bfloat16)
-        if content.is_cuda:
-            dsv41.compressor_tail_scatter(content, scores, tail, write_slots)
-        else:
-            live = write_slots >= 0
-            tail[write_slots[live] // 2, write_slots[live] % 2, 0] = content[live]
-            tail[write_slots[live] // 2, write_slots[live] % 2, 1] = scores[live]
+        live = write_slots >= 0
+        tail[write_slots[live] // 2, write_slots[live] % 2, 0] = content[live]
+        tail[write_slots[live] // 2, write_slots[live] % 2, 1] = scores[live]
         return pooled, pair_positions, pair_requests
 
     def write_global(
@@ -1369,10 +1419,42 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 positions + (ratio - 1) < floor[request_indices.clamp_min(0)]
             )
             slots = slots.masked_fill(below, -1)
+        capture_debug_tensor(
+            current_forward_ctx(), "global_main_input", main_kv, layer_id=owner
+        )
+        capture_debug_tensor(
+            current_forward_ctx(), "global_slots", slots, layer_id=owner
+        )
         if main_rope_cache is None:
-            dsv41.cache_scatter(
-                main_kv, self.cache_pool.global_kv(owner), slots, self.global_format
-            )
+            if self.device == "npu":
+                if _BF16_ONLY_WRITE:
+                    mirror_rows = main_kv
+                    dsv41.cache_scatter_bf16(
+                        main_kv, self.cache_pool.global_bf16(owner), slots
+                    )
+                else:
+                    # The direct attention mirror must contain the same
+                    # quantized/dequantized values as the packed cache, not the
+                    # pre-quantized input. Packing and mirroring in one call
+                    # decodes the bytes this write produced, so no device
+                    # read-back is needed.
+                    mirror_rows = dsv41.cache_scatter_with_mirror(
+                        main_kv,
+                        self.cache_pool.global_kv(owner),
+                        self.cache_pool.global_bf16(owner),
+                        slots,
+                        self.global_format,
+                    )
+                capture_debug_tensor(
+                    current_forward_ctx(),
+                    "global_packed_roundtrip",
+                    mirror_rows,
+                    layer_id=owner,
+                )
+            else:
+                dsv41.cache_scatter(
+                    main_kv, self.cache_pool.global_kv(owner), slots, self.global_format
+                )
         else:
             if self.global_format != "global":
                 raise ValueError(
@@ -1385,6 +1467,19 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 self.cache_pool.global_kv(owner),
                 slots,
             )
+            if self.device == "npu":
+                # The fused RoPE codec packs rows it never returns, so the
+                # mirror still reads them back from the cache.
+                dsv41.cache_scatter_bf16(
+                    dsv41.cache_gather(
+                        self.cache_pool.global_kv(owner),
+                        slots,
+                        self.global_format,
+                        None,
+                    ),
+                    self.cache_pool.global_bf16(owner),
+                    slots,
+                )
         if isinstance(index_k, dsv41.IndexKeyInput):
             if self.index_format == "index":
                 dsv41.index_key_norm_rope_scatter(
@@ -1396,6 +1491,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     self.cache_pool.index_k(owner),
                     slots,
                 )
+                capture_debug_tensor(
+                    current_forward_ctx(),
+                    "global_index_input",
+                    index_k.values,
+                    layer_id=owner,
+                )
                 return
             index_k = dsv41.index_key_norm_rope(
                 index_k.values,
@@ -1404,6 +1505,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 index_k.cos_sin_cache,
                 index_k.norm_eps,
             )
+        capture_debug_tensor(
+            current_forward_ctx(), "global_index_input", index_k, layer_id=owner
+        )
         dsv41.cache_scatter(
             index_k, self.cache_pool.index_k(owner), slots, self.index_format
         )
@@ -1526,6 +1630,15 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 "select_global requires the explicit EXTEND or DECODE query window"
             )
         share = self.sparse_topk
+        capture_debug_tensor(
+            current_forward_ctx(), "selection_index_q", index_q, layer_id=layer_id
+        )
+        capture_debug_tensor(
+            current_forward_ctx(),
+            "selection_index_weights_bf16",
+            index_weights,
+            layer_id=layer_id,
+        )
         record = share.decode if forward_mode.is_decode() else share.prefill
         if layer_id != source:
             if index_q is not None or index_weights is not None:
@@ -1867,6 +1980,15 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         slots = self.global_read_slots(
             owner, rows, positions, request_indices, forward_mode
         )
+        capture_debug_tensor(
+            current_forward_ctx(), "selection_rows", rows, layer_id=layer_id
+        )
+        capture_debug_tensor(
+            current_forward_ctx(), "selection_lengths", lens, layer_id=layer_id
+        )
+        capture_debug_tensor(
+            current_forward_ctx(), "selection_slots", slots, layer_id=layer_id
+        )
         record = V41Selection(
             owner,
             source,
@@ -1908,7 +2030,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             query_shard=None,
         )
         key = (layer_id, forward_mode, id(positions), id(requests))
-        self._prepared_selections[key] = (positions, requests, result)
+        selection = (
+            self.sparse_topk.decode
+            if forward_mode.is_decode()
+            else self.sparse_topk.prefill
+        )
+        self._prepared_selections[key] = (positions, requests, result, selection)
         return result
 
     def _swa_query_plan(
@@ -2245,6 +2372,96 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 self._decode_schedule_keepalive.append(schedule)
         return schedule
 
+    def _forward_v41_ascend_decode(
+        self,
+        q,
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        global_cache,
+        global_slots,
+        global_lens,
+        attn_sink,
+        softmax_scale: float,
+        *,
+        layer_id: int,
+        owner: int,
+        request_indices,
+        forward_mode: ForwardMode,
+        selection: V41Selection,
+    ) -> torch.Tensor:
+        """Run sparse MLA directly from the dequantized BF16 LCM page mirrors.
+
+        The quantized fields and physical slots remain the write/index format;
+        CANN consumes the corresponding BF16 pages through the existing tables.
+        No selected SWA/global rows are materialized on the decode read path.
+        """
+        from tokenspeed_kernel.ops.attention.dsv41.ascend import (
+            ascend_paged_attention_from_bf16,
+        )
+
+        del swa_cache, swa_slots, swa_lens, global_cache, global_slots, global_lens
+        meta = self.query_metadata(forward_mode)
+        tokens = q.shape[0]
+
+        def query_table(table: torch.Tensor) -> torch.Tensor:
+            if table.shape[0] == tokens:
+                return table
+            # Speculative decode has one query row per draft token but one cache
+            # table per request. Invalid padded rows inherit request zero and are
+            # discarded with the other padded outputs.
+            if request_indices.numel() != tokens:
+                raise ValueError("V4.1 query rows do not match the cache tables")
+            return table[request_indices.to(torch.int64).clamp_min(0)]
+
+        # Live request lengths drive ratio-2 residual; decode rows index them.
+        seq_lens = meta.seq_lens.to(torch.int32)[
+            request_indices.to(torch.int64)
+        ].contiguous()
+        global_pages = None
+        global_table = None
+        global_indices = None
+        cmp_ratio = 0
+        if owner >= 0:
+            global_pages = self.cache_pool.global_bf16(owner)
+            global_table = query_table(meta.block_tables[self._owner_group(owner)])
+            if selection.owner != owner or selection.logical_rows is None:
+                raise RuntimeError("V4.1 Ascend decode has the wrong global selection")
+            if selection.ascend_global_indices is None:
+                selection.ascend_global_indices = selection.logical_rows.to(
+                    torch.int32
+                ).contiguous()
+            global_indices = selection.ascend_global_indices
+            cmp_ratio = int(self.spec.compress_ratios[owner])
+
+        timing = _v41_attn_timing(q.device)
+        timing_ctx = current_forward_ctx()
+        t0 = time.perf_counter() if timing else 0.0
+        with layer_kind_scope(timing_ctx, "attention_sparse_mla", layer_id):
+            out = ascend_paged_attention_from_bf16(
+                q,
+                swa_cache=self.cache_pool.swa_bf16(layer_id),
+                swa_block_table=query_table(meta.block_tables[V41_SWA_GROUP_ID]),
+                seq_lens=seq_lens,
+                global_cache=global_pages,
+                global_block_table=global_table,
+                global_sparse_indices=global_indices,
+                attn_sink=attn_sink,
+                softmax_scale=softmax_scale,
+                cmp_ratio=cmp_ratio,
+                context_len=self.context_len,
+            )
+        if timing:
+            sparse_ms = _sync_ms(q.device, t0)
+            global _v41_attn_log_count
+            _v41_attn_log_count += 1
+            if _v41_attn_log_count <= 64 or _v41_attn_log_count % 40 == 0:
+                _logger.info(
+                    f"v41_attn_ms paged_sparse_mla={sparse_ms:.3f} "
+                    f"bs={q.shape[0]!s} owner={owner!s} n={_v41_attn_log_count!s}"
+                )
+        return out
+
     @property
     def supports_fused_attention(self) -> bool:
         # FP8 output must follow the complete softmax, not a DCP partial.
@@ -2453,20 +2670,37 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         prepared = self._prepared_selections.pop(
             (layer_id, forward_mode, id(positions), id(request_indices)), None
         )
+        timing = _v41_attn_timing(q.device)
+        timing_ctx = current_forward_ctx()
         if prepared is None:
-            global_slots, global_lens = self.select_global(
-                layer_id,
-                index_q,
-                index_weights,
-                source_positions if key_rows is not None else positions,
-                source_requests if key_rows is not None else request_indices,
-                forward_mode,
-                index_process_group,
-                projected_partition=None,
-                query_shard=key_rows.plan if key_rows is not None else None,
+            select_t0 = time.perf_counter() if timing else 0.0
+            with layer_kind_scope(timing_ctx, "attention_select_global", layer_id):
+                global_slots, global_lens = self.select_global(
+                    layer_id,
+                    index_q,
+                    index_weights,
+                    source_positions if key_rows is not None else positions,
+                    source_requests if key_rows is not None else request_indices,
+                    forward_mode,
+                    index_process_group,
+                    projected_partition=None,
+                    query_shard=key_rows.plan if key_rows is not None else None,
+                )
+            selection = (
+                self.sparse_topk.decode
+                if forward_mode.is_decode()
+                else self.sparse_topk.prefill
             )
+            if timing and forward_mode.is_decode():
+                select_ms = _sync_ms(q.device, select_t0)
+                if _v41_attn_log_count <= 64 or _v41_attn_log_count % 40 == 0:
+                    _logger.info(
+                        f"v41_attn_ms select_global={select_ms:.3f} "
+                        f"bs={q.shape[0]!s} layer={layer_id!s}"
+                    )
         else:
             global_slots, global_lens = prepared[2]
+            selection = prepared[3]
         owner = self.spec.kv_owners[layer_id]
         global_cache = self.cache_pool.global_kv(owner) if owner >= 0 else None
         cache = self.cache_pool.swa(layer_id)
@@ -2493,20 +2727,58 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         if forward_mode.is_decode():
             # The current position cannot alias one of its previous 127 logical
             # rows. Ordinary retained-page writes therefore precede paged decode.
-            if swa_rope_cache is None:
-                dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
-            else:
-                dsv41.swa_rope_scatter(
-                    swa_kv,
-                    positions,
-                    swa_rope_cache,
-                    cache,
-                    locations,
-                    self.swa_format,
-                    None,
-                    swa_norm_weight,
-                    swa_norm_eps,
-                )
+            scatter_t0 = time.perf_counter() if timing else 0.0
+            with layer_kind_scope(timing_ctx, "attention_swa_scatter", layer_id):
+                mirror_rows = None
+                if self.device == "npu" and swa_rope_cache is not None:
+                    mirror_rows = torch.empty(
+                        swa_kv.shape, dtype=torch.bfloat16, device=swa_kv.device
+                    )
+                if swa_rope_cache is None:
+                    if self.device == "npu":
+                        if _BF16_ONLY_WRITE:
+                            mirror_rows = swa_kv
+                            dsv41.cache_scatter_bf16(
+                                swa_kv, self.cache_pool.swa_bf16(layer_id), locations
+                            )
+                        else:
+                            # Pack and mirror in one call: the mirror holds the
+                            # dequantized bytes of this write, without re-reading
+                            # the cache from the device.
+                            mirror_rows = dsv41.cache_scatter_with_mirror(
+                                swa_kv,
+                                cache,
+                                self.cache_pool.swa_bf16(layer_id),
+                                locations,
+                                self.swa_format,
+                            )
+                    else:
+                        dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
+                else:
+                    dsv41.swa_rope_scatter(
+                        swa_kv,
+                        positions,
+                        swa_rope_cache,
+                        cache,
+                        locations,
+                        self.swa_format,
+                        mirror_rows,
+                        swa_norm_weight,
+                        swa_norm_eps,
+                    )
+                    if self.device == "npu":
+                        # The fused RoPE codec returns the dequantized rows it
+                        # wrote, so the mirror needs no gather here either.
+                        dsv41.cache_scatter_bf16(
+                            mirror_rows, self.cache_pool.swa_bf16(layer_id), locations
+                        )
+            if timing:
+                scatter_ms = _sync_ms(q.device, scatter_t0)
+                if _v41_attn_log_count <= 64 or _v41_attn_log_count % 40 == 0:
+                    _logger.info(
+                        f"v41_attn_ms scatter={scatter_ms:.3f} "
+                        f"rope={swa_rope_cache is not None!s} bs={q.shape[0]!s}"
+                    )
             swa_slots, swa_lens = (
                 (metadata.swa_read_slots, metadata.swa_read_lens)
                 if canonical
@@ -2567,6 +2839,28 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     rank=self.kvp_rank,
                     sink=attn_sink[:heads],
                     keep_all_heads=False,
+                )
+                if out_rope_cache is not None:
+                    dsv41.rope_inplace(out, positions, out_rope_cache, None)
+                return out
+            from tokenspeed_kernel.platform import current_platform
+
+            if current_platform().is_npu:
+                out = self._forward_v41_ascend_decode(
+                    q,
+                    cache,
+                    swa_slots,
+                    swa_lens,
+                    global_cache,
+                    global_slots,
+                    global_lens,
+                    attn_sink,
+                    softmax_scale,
+                    layer_id=layer_id,
+                    owner=owner,
+                    request_indices=request_indices,
+                    forward_mode=forward_mode,
+                    selection=selection,
                 )
                 if out_rope_cache is not None:
                     dsv41.rope_inplace(out, positions, out_rope_cache, None)
@@ -2758,7 +3052,27 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 else V41_PREFILL_QUERY_TILE
             )
             group = self.spec.attention_query_group
-            if fused_decode_groups is not None:
+            from tokenspeed_kernel.platform import current_platform
+
+            if current_platform().is_npu:
+                from tokenspeed_kernel.ops.attention.dsv41.ascend import (
+                    ascend_prefill_attention_from_workspace,
+                )
+
+                result = ascend_prefill_attention_from_workspace(
+                    batch_q,
+                    workspace,
+                    indices.contiguous(),
+                    swa_width=batch.swa_indices.shape[-1],
+                    attn_sink=attn_sink,
+                    softmax_scale=softmax_scale,
+                    cmp_ratio=(
+                        0 if owner < 0 else int(self.spec.compress_ratios[owner])
+                    ),
+                    seq_lens=(positions[rows].to(torch.int32) + 1).reshape(-1),
+                    ori_win_left=V41_WINDOW_SIZE - 1,
+                )
+            elif fused_decode_groups is not None:
                 # One call per batch: the fused kernel rotates this batch's
                 # queries, attends, rotates the result back and casts it, so
                 # the rows it returns are already the output projection's
@@ -2838,8 +3152,32 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             elif output is None:
                 out[rows] = result
             del workspace, indices
+        swa_mirror = (
+            self.cache_pool.swa_bf16(layer_id) if self.device == "npu" else None
+        )
         if swa_rope_cache is None:
-            dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
+            if swa_mirror is not None:
+                if _BF16_ONLY_WRITE:
+                    dsv41.cache_scatter_bf16(swa_kv, swa_mirror, locations)
+                else:
+                    # Pack and mirror in one call, so the prefix-extend write
+                    # does not read its own bytes back to fill the mirror.
+                    dsv41.cache_scatter_with_mirror(
+                        swa_kv, cache, swa_mirror, locations, self.swa_format
+                    )
+            else:
+                dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
+        if swa_mirror is not None:
+            if layout.prefix_slots.numel() > 0:
+                dsv41.cache_scatter_bf16(prefixes, swa_mirror, layout.prefix_slots)
+            if swa_rope_cache is not None:
+                # The fused RoPE codec wrote the cache rows itself, so their
+                # dequantized mirror rows still come from the cache.
+                dsv41.cache_scatter_bf16(
+                    dsv41.cache_gather(cache, locations, self.swa_format, None),
+                    swa_mirror,
+                    locations,
+                )
         if out_rope_cache is not None:
             dsv41.rope_inplace(out, positions, out_rope_cache, None)
         return out

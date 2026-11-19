@@ -44,6 +44,9 @@ from tokenspeed.runtime.configs.device_config import DeviceConfig
 from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.quantization.ascend_format import (
+    weights_index_filename,
+)
 from tokenspeed.runtime.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -316,6 +319,11 @@ class DefaultModelLoader(BaseModelLoader):
             )
         else:
             hf_folder = model_name_or_path
+
+        ascend_index = weights_index_filename(hf_folder)
+        if ascend_index is not None:
+            index_file = ascend_index
+            use_safetensors = True
 
         hf_weights_files: list[str] = []
         for pattern in allow_patterns:

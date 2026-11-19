@@ -266,6 +266,27 @@ def test_silu_and_mul_applies_glm_clamp(device: str) -> None:
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
+def test_silu_and_mul_clamped_writes_provided_output(device: str) -> None:
+    x = torch.randn(8, 512, device=device, dtype=torch.bfloat16)
+    out = torch.empty(8, 256, device=device, dtype=torch.bfloat16)
+    same = silu_and_mul(x, out, limit=10.0)
+    assert same.data_ptr() == out.data_ptr()
+
+
+@pytest.mark.parametrize("shape", [(8, 2048), (128, 4096)])
+def test_silu_and_mul_clamped_pins_plain_swiglu(
+    shape: tuple[int, int], device: str
+) -> None:
+    # CANN's clipped SwiGLU defaults to the OAI variant (alpha 1.702, bias 1.0,
+    # interleaved halves). This pins the plain gate/up halves and unit alpha.
+    x = torch.randn(shape, device=device, dtype=torch.bfloat16) * 3
+    ref = torch_silu_and_mul(x, 7.0)
+
+    out = silu_and_mul(x, limit=7.0)
+
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
 def test_silu_and_mul_empty(device: str) -> None:
     x = torch.empty(0, 512, device=device, dtype=torch.bfloat16)
     out = silu_and_mul(x)

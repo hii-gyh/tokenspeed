@@ -921,6 +921,7 @@ public address used by EPD.
 | `--log-level` | Runtime log level. |
 | `--enable-async-logging` | Write Rust host and default Python root logs on background threads. Defaults to off; `--no-enable-async-logging` explicitly selects synchronous output. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
+| `--ttft-trace-sampling-percentage` | Log engine TTFT phases for this integer percentage of PD bootstrap rooms. `0` (the default) disables sampling; valid values are `0` through `100`. Prefill and decode use the same sampling decision. |
 | `--enable-metrics` | Enable the selected metrics reporters. |
 | `--metrics-reporters` | Select `prometheus` or an installed metric output; repeat for multiple. Defaults to `prometheus`. |
 | `--metrics-reporter-config` | JSON file mapping external reporter names to their settings. See [metric output plugins](../metrics-plugins.md). |

@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from tokenspeed.runtime.layers.quantization.ascend import AscendQuantConfig
 from tokenspeed.runtime.layers.quantization.base_config import (  # noqa: F401
     QuantizationConfig,
     QuantizeMethodBase,
@@ -45,6 +46,7 @@ BASE_QUANTIZATION_METHODS: dict[str, type[QuantizationConfig]] = {
     "nvfp4": Nvfp4Config,
     "mxfp4": Mxfp4Config,
     "modelopt_mixed": ModelOptMixedConfig,
+    "ascend": AscendQuantConfig,
 }
 
 
